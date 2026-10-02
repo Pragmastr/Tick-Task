@@ -7,7 +7,7 @@
 
 <p><b>Создавай. | Планируй. | Выполняй.</b></p>
 
-[![Скачать APK](https://shields.io./badge/Скачать_APK-Tick--Task-orange?style=for-the-badge&logo=android)](https://github.com/Sozdatel1/Tick-Task/releases/download/Developments/Tick-Task.android.V1.0.apk)
+[![Скачать APK](https://shields.io./badge/Скачать_APK-Tick--Task-orange?style=for-the-badge&logo=android)](https://github.com/Sozdatel1/Tick-Task/releases/download/Tick-task/Tick-Task.android.V1.0.apk)
 
 
 </div>
