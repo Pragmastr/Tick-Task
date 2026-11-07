@@ -110,6 +110,12 @@ fun TaskItem(
                     onDismissRequest = { menuExpanded = false },
                     modifier = Modifier.background(com.example.elitetodo.ui.theme.SoftLightBlue)
                 ) {
+
+                    //HorizontalDivider(
+                      //  modifier = Modifier.padding(horizontal = 8.dp),
+                       // thickness = 1.dp,
+                      //  color = Color.LightGray.copy(alpha = 0.6f)
+                    //)
                     DropdownMenuItem(
                         text = { Text("Удалить") },
                         onClick = {
@@ -117,30 +123,8 @@ fun TaskItem(
                             onMenuClick() // Пробрасываем событие удаления в MainActivity
                         }
                     )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                        thickness = 1.dp,
-                        color = Color.LightGray.copy(alpha = 0.6f)
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Удалить") },
-                        onClick = {
-                            menuExpanded = false
-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
-                        }
-                    )
-                    HorizontalDivider(
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                        thickness = 1.dp,
-                        color = Color.LightGray.copy(alpha = 0.6f)
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Удалить нафиг отсюда") },
-                        onClick = {
-                            menuExpanded = false
-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
-                        }
-                    )
+
+
                 }
             }
         }

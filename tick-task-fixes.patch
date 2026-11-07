@@ -1,0 +1,680 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 85a5c48..d2d7c01 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -52,7 +52,6 @@ dependencies {
+     implementation(libs.androidx.compose.ui.tooling.preview)
+     implementation(libs.androidx.core.ktx)
+     implementation(libs.androidx.lifecycle.runtime.ktx)
+-    implementation(libs.core.ktx)
+     testImplementation(libs.junit)
+     androidTestImplementation(platform(libs.androidx.compose.bom))
+     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+@@ -60,8 +59,6 @@ dependencies {
+     androidTestImplementation(libs.androidx.junit)
+     debugImplementation(libs.androidx.compose.ui.test.manifest)
+     debugImplementation(libs.androidx.compose.ui.tooling)
+-    implementation("androidx.room:room-runtime:2.6.1")
+-    implementation("androidx.room:room-ktx:2.6.1")
+ 
+     implementation("androidx.compose.material:material-icons-extended")
+ 
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 67f9d1a..3b06927 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -4,7 +4,6 @@
+     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <application
+ 
+         android:allowBackup="true"
+@@ -19,6 +18,7 @@
+             android:name=".MainActivity"
+             android:exported="true"
+             android:label="@string/app_name"
++            android:launchMode="singleTop"
+             android:theme="@style/Theme.EliteToDo"
+             android:windowSoftInputMode="adjustResize">
+             <intent-filter>
+diff --git a/app/src/main/java/com/example/elitetodo/AlarmActivity.kt b/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
+index 626ff4c..a6bda44 100644
+--- a/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
++++ b/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
+@@ -9,10 +9,6 @@ import android.view.WindowManager
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.compose.runtime.Composable
+-import kotlinx.coroutines.CoroutineScope
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.launch
+-import todo.Todo
+ 
+ class AlarmActivity : ComponentActivity() {
+ 
+@@ -34,36 +30,25 @@ class AlarmActivity : ComponentActivity() {
+             )
+         }
+ 
+-        val taskIdStrFromIntent = intent.getStringExtra("alarm_task_id") ?: ""
+-        val taskIdInt = taskIdStrFromIntent.toIntOrNull() ?: 0
+-        val taskIdString = taskIdInt.toString()
++        val taskIdInt = intent.getStringExtra("alarm_task_id")?.toIntOrNull() ?: -1
+         val taskTitle = intent.getStringExtra("alarm_task_title") ?: "Задача"
+ 
+         android.util.Log.d("EliteTodoLOG", "AlarmActivity зажглась! ID = $taskIdInt, Заголовок = '$taskTitle'")
+ 
+         setContent {
+             AlarmActivityContent(taskTitle = taskTitle) {
+-                if (taskIdInt != 0) {
+-                    // Используем фоновый поток через CoroutineScope для вызова Go-библиотеки
+-                    CoroutineScope(Dispatchers.IO).launch {
+-                        try {
+-                            val dbPath = applicationContext.getDatabasePath("elite_final.db").absolutePath
+-                            val goTodoService = Todo.newTodoService(dbPath)
+-
+-                            // ИСПРАВЛЕНО: Применяем .toLong() к первому аргументу и суффикс L ко второму
+-                            goTodoService.updateTaskStatus(taskIdInt.toLong(), 1L)
+-                            goTodoService.close()
+-                            android.util.Log.d("EliteTodoLOG", "AlarmActivity: Статус задачи $taskIdInt сохранен через Go!")
+-                        } catch (e: Exception) {
+-                            android.util.Log.e("EliteTodoLOG", "Ошибка записи в Go из AlarmActivity: ${e.message}")
+-                        }
+-                    }
+-                }
+-
++                // Запись статуса "Выполнено", снятие уведомления и обновление UI целиком
++                // делегируем MainActivity (ACTION_DISMISS_ALARM): у него уже открыт
++                // единственный Go-сервис БД. Второе подключение отсюда ловило
++                // SQLITE_BUSY ("database is locked") и дублировало запись статуса.
+                 val dismissIntent = Intent(this@AlarmActivity, MainActivity::class.java).apply {
+                     action = "ACTION_DISMISS_ALARM"
+-                    putExtra("task_id", taskIdString)
+-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                    putExtra("task_id", taskIdInt.toString())
++                    addFlags(
++                        Intent.FLAG_ACTIVITY_NEW_TASK or
++                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
++                                Intent.FLAG_ACTIVITY_CLEAR_TOP
++                    )
+                 }
+                 startActivity(dismissIntent)
+                 finish()
+diff --git a/app/src/main/java/com/example/elitetodo/AlarmScreen.kt b/app/src/main/java/com/example/elitetodo/AlarmScreen.kt
+index d868d73..79d61b3 100644
+--- a/app/src/main/java/com/example/elitetodo/AlarmScreen.kt
++++ b/app/src/main/java/com/example/elitetodo/AlarmScreen.kt
+@@ -19,6 +19,9 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.compose.ui.viewinterop.AndroidView
+ 
++/** Полная высота свайпа вверх (в пикселях), после которого будильник выключается. */
++private const val SWIPE_DISMISS_THRESHOLD = 160f
++
+ @Composable
+ fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
+     // Бесконечная плавная анимация стрелки вверх-вниз
+@@ -33,16 +36,25 @@ fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
+         label = "offset"
+     )
+ 
++    // Накопитель вертикального смещения: свайп состоит из множества мелких
++    // событий, порог по одному событию (dragAmount.y < -50) почти недостижим.
++    var accumulatedDrag by remember { mutableFloatStateOf(0f) }
++
+     Box(
+         modifier = Modifier
+             .fillMaxSize()
+             .background(Color(0xFF121212))
+             .pointerInput(Unit) {
+-                detectDragGestures { change, dragAmount ->
++                detectDragGestures(
++                    onDragStart = { accumulatedDrag = 0f },
++                    onDragEnd = {
++                        if (accumulatedDrag < -SWIPE_DISMISS_THRESHOLD) onDismiss()
++                    },
++                    onDragCancel = { accumulatedDrag = 0f }
++                ) { change, dragAmount ->
+                     change.consume()
+-                    if (dragAmount.y < -50) {
+-                        onDismiss()
+-                    }
++                    accumulatedDrag += dragAmount.y
++                    if (accumulatedDrag < -SWIPE_DISMISS_THRESHOLD) onDismiss()
+                 }
+             },
+         contentAlignment = Alignment.Center
+diff --git a/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt b/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
+index 4ea5dea..aa44b52 100644
+--- a/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
++++ b/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
+@@ -24,52 +24,91 @@ object AndroidAlarmManager {
+         try {
+             val dateTimeStr = "$dateStr $timeStr"
+             val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
++            sdf.isLenient = false
+             val date = sdf.parse(dateTimeStr) ?: return
+             val epochTime = date.time
+ 
+-            // ИСПРАВЛЕНО 1: Направляем интент в невидимый системный ресивер, а не на экран Активити
+-            //val receiverClass = Class.forName("${context.packageName}.AlarmReceiver")
++            // Не взводим будильник в прошлое: в лучшем случае он сработал бы мгновенно
++            // и разбудил пользователя по уже прошедшей задаче.
++            if (epochTime <= System.currentTimeMillis()) {
++                Log.d(TAG, "[Android] Будильник для ID=$taskId не взведён: время $dateTimeStr уже прошло")
++                return
++            }
++
+             val alarmIntent = Intent(context, AlarmReceiver::class.java).apply {
+                 action = "ACTION_LAUNCH_ALARM"
+                 putExtra("alarm_task_id", taskId.toString())
+                 putExtra("alarm_task_title", title)
+             }
+ 
+-            // ИСПРАВЛЕНО 2: Для ресиверов в Android 13+ используем FLAG_IMMUTABLE (это безопаснее и железно работает)
+-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+-            } else {
+-                PendingIntent.FLAG_UPDATE_CURRENT
+-            }
++            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+ 
+             // Создаем PendingIntent для БРОДКАСТА (getBroadcast вместо getActivity)
+             val alarmPendingIntent = PendingIntent.getBroadcast(context, taskId + 2000, alarmIntent, flags)
+             val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+ 
+-            // ИСПРАВЛЕНО 3: Переводим на ультимативный метод, который зажигает спящий экран и пробивает Doze Mode
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                alarmManager.setExactAndAllowWhileIdle(
+-                    AlarmManager.RTC_WAKEUP, // RTC_WAKEUP силой включает процессор из сна
+-                    epochTime,
+-                    alarmPendingIntent
+-                )
++            val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                alarmManager.canScheduleExactAlarms()
++            } else {
++                true
++            }
++
++            if (canExact) {
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                    alarmManager.setExactAndAllowWhileIdle(
++                        AlarmManager.RTC_WAKEUP,
++                        epochTime,
++                        alarmPendingIntent
++                    )
++                } else {
++                    alarmManager.setExact(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
++                }
+             } else {
+-                alarmManager.setExact(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
++                // Пользователь отозвал SCHEDULE_EXACT_ALARM — деградируем до неточного
++                // будильника вместо SecurityException и полной потери напоминания.
++                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
++                Log.w(TAG, "[Android] Точные будильники запрещены, взведён неточный для ID=$taskId")
+             }
+ 
+-            Log.d(TAG, "[Android] Ультимативный будильник взведён на $epochTime мс (пробьет сон и смахнутый кэш)")
++            Log.d(TAG, "[Android] Будильник взведён на $epochTime мс (ID=$taskId)")
+         } catch (e: Exception) {
+             Log.e(TAG, "[Ошибка Будильника]: ${e.message}", e)
+         }
+     }
+ 
++    /**
++     * Полная зачистка задачи: снимает системный будильник и убирает зависшее
++     * уведомление. Вызывается при удалении задачи и при отметке её выполненной.
++     */
++    fun cancelAllForTask(context: Context, taskId: Int) {
++        try {
++            val alarmIntent = Intent(context, AlarmReceiver::class.java).apply {
++                action = "ACTION_LAUNCH_ALARM"
++                putExtra("alarm_task_id", taskId.toString())
++            }
++            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++            val alarmPendingIntent = PendingIntent.getBroadcast(context, taskId + 2000, alarmIntent, flags)
++            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
++            alarmManager.cancel(alarmPendingIntent)
++            alarmPendingIntent.cancel()
++        } catch (e: Exception) {
++            Log.e(TAG, "[Ошибка снятия будильника]: ${e.message}", e)
++        }
++
++        try {
++            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++            notificationManager.cancel(taskId + 1000)
++        } catch (e: Exception) {
++            Log.e(TAG, "[Ошибка отмены уведомления]: ${e.message}", e)
++        }
++    }
+ 
+     fun showAlarmNotification(context: Context, taskId: Int, title: String) {
+         try {
+             val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+             val alarmSound = Uri.parse("content://settings/system/alarm_alert")
+ 
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {7
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                 if (notificationManager.getNotificationChannel(CHANNEL_ID) == null) {
+                     val importance = NotificationManager.IMPORTANCE_MAX
+                     val channel = NotificationChannel(CHANNEL_ID, "Будильник Списка Дел", importance).apply {
+@@ -84,58 +123,37 @@ object AndroidAlarmManager {
+                     }
+                     notificationManager.createNotificationChannel(channel)
+                 }
+-
+-
+-
+             }
++
+             // Направляем интент на наш ресивер с фейковым экшеном, чтобы система разрешила зажечь экран, но ничего не открывала
+-            // ИСПРАВЛЕНО: Направляем интент СТРОГО на AlarmActivity вместо MainActivity
+             val alarmIntent = Intent(context, AlarmActivity::class.java).apply {
+                 putExtra("alarm_task_id", taskId.toString())
+                 putExtra("alarm_task_title", title)
+                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+             }
+ 
+-            val immutableFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+-            } else {
+-                PendingIntent.FLAG_UPDATE_CURRENT
+-            }
+-            val mutableFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+-            } else {
+-                PendingIntent.FLAG_UPDATE_CURRENT
+-            }
+-            val intent = Intent(context, Class.forName("${context.packageName}.MainActivity")).apply {
+-                action = "ACTION_LAUNCH_ALARM"
+-                putExtra("alarm_task_id", taskId.toString())
+-                putExtra("alarm_task_title", title)
+-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+-            }
++            val immutableFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+             val fullScreenPendingIntent = PendingIntent.getActivity(context, taskId + 3000, alarmIntent, immutableFlags)
+-            val dismissIntent = Intent(context, Class.forName("${context.packageName}.MainActivity")).apply {
++            val dismissIntent = Intent(context, MainActivity::class.java).apply {
+                 action = "ACTION_DISMISS_ALARM"
+                 putExtra("task_id", taskId.toString())
+                 addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+             }
+ 
+-
+-
+-            val dismissPending = PendingIntent.getActivity(context, taskId + 1000, dismissIntent, mutableFlags)
++            val dismissPending = PendingIntent.getActivity(context, taskId + 1000, dismissIntent, immutableFlags)
+ 
+             val appIconBitmap = android.graphics.BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
+             val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+                 .setContentTitle("⏰ СРАБОТАЛ БУДИЛЬНИК!")
+                 .setContentText(title)
+-//                .setSmallIcon(appIconId)
+                 .setSmallIcon(R.drawable.ic_notification)
+                 .setPriority(NotificationCompat.PRIORITY_MAX)
+-                .setCategory(Notification.CATEGORY_ALARM) //если что поменять на alarm
++                .setCategory(Notification.CATEGORY_ALARM)
+                 .setSound(alarmSound)
+                 .setLargeIcon(appIconBitmap)
+                 .setAutoCancel(false)
+                 .setOngoing(true)
+-                .addAction(R.mipmap.ic_launcher, "ВЫКЛЮЧИТЬ", dismissPending)
++                .addAction(R.drawable.ic_notification, "ВЫКЛЮЧИТЬ", dismissPending)
+                 .setFullScreenIntent(fullScreenPendingIntent, true)
+                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+ 
+diff --git a/app/src/main/java/com/example/elitetodo/MainActivity.kt b/app/src/main/java/com/example/elitetodo/MainActivity.kt
+index b156a70..bd2b596 100644
+--- a/app/src/main/java/com/example/elitetodo/MainActivity.kt
++++ b/app/src/main/java/com/example/elitetodo/MainActivity.kt
+@@ -66,12 +66,8 @@ class MainActivity : ComponentActivity() {
+                 LaunchedEffect(Unit) {
+                     refreshUi()
+                 }
+-                LaunchedEffect(Unit) {
+-                    refreshUi()
+-                }
+ 
+                 var showAddDialog by remember { mutableStateOf(false) }
+-                var showMenuTaskId by remember { mutableStateOf<Int?>(null) }
+                 var taskToDeleteId by remember { mutableStateOf<Int?>(null) }
+ 
+                 TodoScreen(
+@@ -81,11 +77,23 @@ class MainActivity : ComponentActivity() {
+                         val status = if (isChecked) 1 else 0
+                         lifecycleScope.launch(Dispatchers.IO) {
+                             try {
+-                                // ИСПРАВЛЕНО: приводим ID и статус к типу Long с помощью .toLong()
+                                 goTodoService?.updateTaskStatus(
+                                     taskEntity.id.toLong(),
+                                     status.toLong()
+                                 )
++                                // Выполненная задача больше не должна будить уведомлением,
++                                // а возврат в "активные" — заново взводит будильник.
++                                if (isChecked) {
++                                    AndroidAlarmManager.cancelAllForTask(this@MainActivity, taskEntity.id)
++                                } else {
++                                    AndroidAlarmManager.scheduleNotification(
++                                        this@MainActivity,
++                                        taskEntity.id,
++                                        taskEntity.title,
++                                        taskEntity.date,
++                                        taskEntity.time
++                                    )
++                                }
+                                 refreshUi()
+                             } catch (e: Exception) {
+                                 Log.e(TAG, "Ошибка изменения статуса в Go: ${e.message}")
+@@ -95,22 +103,6 @@ class MainActivity : ComponentActivity() {
+                     onTaskMenuClick = { taskEntity -> taskToDeleteId = taskEntity.id }
+                 )
+ 
+-
+-                // if (showMenuTaskId != null) {
+-                //   DropdownMenu(
+-                //     expanded = true,
+-                //      onDismissRequest = { showMenuTaskId = null }
+-                //    ) {
+-                //         DropdownMenuItem(
+-                //            text = { Text("Удалить") },
+-                //             onClick = {
+-                //                 taskToDeleteId = showMenuTaskId
+-                //                 showMenuTaskId = null
+-                //             }
+-                //         )
+-                //     }
+-                //  }
+-
+                 if (taskToDeleteId != null) {
+                     AlertDialog(
+                         onDismissRequest = { taskToDeleteId = null },
+@@ -123,8 +115,10 @@ class MainActivity : ComponentActivity() {
+                                     taskToDeleteId?.let { id ->
+                                         lifecycleScope.launch(Dispatchers.IO) {
+                                             try {
+-                                                // ИСПРАВЛЕНО: приводим id к типу Long с помощью .toLong()
+                                                 goTodoService?.deleteTask(id.toLong())
++                                                // Задача удалена — снимаем её будильник и уведомление,
++                                                // иначе будильник сработает по несуществующей задаче.
++                                                AndroidAlarmManager.cancelAllForTask(this@MainActivity, id)
+                                                 refreshUi()
+                                             } catch (e: Exception) {
+                                                 Log.e(TAG, "Ошибка удаления в Go: ${e.message}")
+@@ -272,14 +266,12 @@ class MainActivity : ComponentActivity() {
+     private fun refreshUi() {
+         lifecycleScope.launch(Dispatchers.IO) {
+             try {
+-                kotlinx.coroutines.delay(150)
+-
+                 // Запрашиваем JSON строку у Go
+                 val jsonTasks = goTodoService?.allTasksSortedJSON ?: "[]"
+ 
+                 // Десериализуем её в список объектов Kotlin
+                 val type = object : TypeToken<List<TaskEntity>>() {}.type
+-                val freshTasks: List<TaskEntity> = gson.fromJson(jsonTasks, type)
++                val freshTasks: List<TaskEntity> = gson.fromJson(jsonTasks, type) ?: emptyList()
+ 
+                 withContext(Dispatchers.Main) {
+                     tasksState.clear()
+diff --git a/app/src/main/java/com/example/elitetodo/Task.kt b/app/src/main/java/com/example/elitetodo/Task.kt
+deleted file mode 100644
+index bc2abc7..0000000
+--- a/app/src/main/java/com/example/elitetodo/Task.kt
++++ /dev/null
+@@ -1,8 +0,0 @@
+-package com.example.elitetodo
+-
+-data class Task(
+-    val id: Int,
+-    val text: String,
+-    val secondaryText: String,
+-    val isActive: Boolean
+-)
+\ No newline at end of file
+diff --git a/app/src/main/java/com/example/elitetodo/TodoComponents.kt b/app/src/main/java/com/example/elitetodo/TodoComponents.kt
+index b7da789..8643f7e 100644
+--- a/app/src/main/java/com/example/elitetodo/TodoComponents.kt
++++ b/app/src/main/java/com/example/elitetodo/TodoComponents.kt
+@@ -32,7 +32,7 @@ fun TaskItem(
+     onCheckboxClick: (Boolean) -> Unit,
+     onMenuClick: () -> Unit
+ ) {
+-    val isTaskActive = task.status == 1
++    val isTaskDone = task.status == 1
+     // Локальное состояние открытия меню для конкретной карточки
+     var menuExpanded by remember { mutableStateOf(false) }
+ 
+@@ -44,9 +44,9 @@ fun TaskItem(
+         verticalAlignment = Alignment.CenterVertically
+     ) {
+         Icon(
+-            imageVector = if (isTaskActive) Icons.Default.CheckCircle else Icons.Default.DateRange,
++            imageVector = if (isTaskDone) Icons.Default.CheckCircle else Icons.Default.DateRange,
+             contentDescription = "Status Icon",
+-            tint = if (isTaskActive) Color.Gray else MaterialTheme.colorScheme.primary,
++            tint = if (isTaskDone) Color.Gray else MaterialTheme.colorScheme.primary,
+             modifier = Modifier
+                 .padding(start = 16.dp, end = 16.dp)
+                 .size(24.dp)
+@@ -61,8 +61,8 @@ fun TaskItem(
+                 text = task.title,
+                 fontSize = 16.sp,
+                 fontWeight = FontWeight.Normal,
+-                textDecoration = if (isTaskActive) TextDecoration.LineThrough else TextDecoration.None,
+-                color = if (isTaskActive) Color.Gray else Color.Black
++                textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None,
++                color = if (isTaskDone) Color.Gray else Color.Black
+             )
+             val secondaryText = "${task.date} в ${task.time}"
+             if (secondaryText.trim().isNotEmpty())  {
+@@ -70,7 +70,7 @@ fun TaskItem(
+                     text = secondaryText,
+                     fontSize = 14.sp,
+                     color = Color.Gray,
+-                    textDecoration = if (isTaskActive) TextDecoration.LineThrough else TextDecoration.None
++                    textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None
+                 )
+             }
+         }
+@@ -83,7 +83,7 @@ fun TaskItem(
+             verticalAlignment = Alignment.CenterVertically
+         ) {
+             Checkbox(
+-                checked = isTaskActive,
++                checked = isTaskDone,
+                 onCheckedChange = { onCheckboxClick(it) },
+                 modifier = Modifier.size(32.dp),
+                 colors = CheckboxDefaults.colors(checkedColor = MaterialTheme.colorScheme.primary)
+@@ -117,30 +117,6 @@ fun TaskItem(
+                             onMenuClick() // Пробрасываем событие удаления в MainActivity
+                         }
+                     )
+-                    HorizontalDivider(
+-                        modifier = Modifier.padding(horizontal = 8.dp),
+-                        thickness = 1.dp,
+-                        color = Color.LightGray.copy(alpha = 0.6f)
+-                    )
+-                    DropdownMenuItem(
+-                        text = { Text("Удалить") },
+-                        onClick = {
+-                            menuExpanded = false
+-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
+-                        }
+-                    )
+-                    HorizontalDivider(
+-                        modifier = Modifier.padding(horizontal = 8.dp),
+-                        thickness = 1.dp,
+-                        color = Color.LightGray.copy(alpha = 0.6f)
+-                    )
+-                    DropdownMenuItem(
+-                        text = { Text("Удалить нафиг отсюда") },
+-                        onClick = {
+-                            menuExpanded = false
+-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
+-                        }
+-                    )
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/example/elitetodo/ui/theme/Theme.kt b/app/src/main/java/com/example/elitetodo/ui/theme/Theme.kt
+index a2ad99d..409d45a 100644
+--- a/app/src/main/java/com/example/elitetodo/ui/theme/Theme.kt
++++ b/app/src/main/java/com/example/elitetodo/ui/theme/Theme.kt
+@@ -1,6 +1,5 @@
+ package com.example.elitetodo.ui.theme
+ 
+-import android.app.Activity
+ import android.os.Build
+ import androidx.compose.foundation.isSystemInDarkTheme
+ import androidx.compose.material3.MaterialTheme
+@@ -9,7 +8,6 @@ import androidx.compose.material3.dynamicDarkColorScheme
+ import androidx.compose.material3.dynamicLightColorScheme
+ import androidx.compose.material3.lightColorScheme
+ import androidx.compose.runtime.Composable
+-import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.platform.LocalContext
+ private val DarkColorScheme = darkColorScheme(
+diff --git a/gonative/todo/todo.go b/gonative/todo/todo.go
+index 86bc04b..29deb82 100644
+--- a/gonative/todo/todo.go
++++ b/gonative/todo/todo.go
+@@ -25,11 +25,18 @@ type TodoService struct {
+ 
+ // NewTodoService открывает базу данных и готовит таблицы. Прогрев происходит атомарно.
+ func NewTodoService(dbPath string) (*TodoService, error) {
+-	db, err := sql.Open("sqlite", dbPath)
++	// busy_timeout заставляет ждущие соединения дожидаться снятия блокировки
++	// вместо мгновенного SQLITE_BUSY; WAL разрешает чтение во время записи.
++	dsn := "file:" + dbPath + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
++	db, err := sql.Open("sqlite", dsn)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to open database: %w", err)
+ 	}
+ 
++	// Сериализуем доступ внутри процесса: один писатель — нет взаимных блокировок.
++	db.SetMaxOpenConns(1)
++	db.SetMaxIdleConns(1)
++
+ 	service := &TodoService{db: db}
+ 	if err := service.createTables(); err != nil {
+ 		db.Close()
+@@ -75,6 +82,10 @@ func (s *TodoService) GetAllTasksSortedJSON() (string, error) {
+ 		tasks = append(tasks, t)
+ 	}
+ 
++	if err := rows.Err(); err != nil {
++		return "", err
++	}
++
+ 	if len(tasks) == 0 {
+ 		return "[]", nil
+ 	}
+diff --git a/gonative/todo/todo_test.go b/gonative/todo/todo_test.go
+new file mode 100644
+index 0000000..fefd267
+--- /dev/null
++++ b/gonative/todo/todo_test.go
+@@ -0,0 +1,100 @@
++package todo
++
++import (
++	"path/filepath"
++	"sync"
++	"testing"
++)
++
++func newTestService(t *testing.T) *TodoService {
++	t.Helper()
++	dir := t.TempDir()
++	s, err := NewTodoService(filepath.Join(dir, "test.db"))
++	if err != nil {
++		t.Fatalf("NewTodoService: %v", err)
++	}
++	t.Cleanup(func() { s.Close() })
++	return s
++}
++
++func TestAddAndGetSorted(t *testing.T) {
++	s := newTestService(t)
++
++	id1, err := s.AddTaskAndGetID("Задача A", "05.01.2026", "10:00")
++	if err != nil || id1 != 1 {
++		t.Fatalf("add A: id=%d err=%v", id1, err)
++	}
++	if _, err := s.AddTaskAndGetID("Задача B", "2026-01-03", "09:00"); err != nil {
++		t.Fatalf("add B: %v", err)
++	}
++	if _, err := s.AddTaskAndGetID("Задача C", "05.01.2026", "08:00"); err != nil {
++		t.Fatalf("add C: %v", err)
++	}
++
++	json, err := s.GetAllTasksSortedJSON()
++	if err != nil {
++		t.Fatalf("all: %v", err)
++	}
++	want := `[{"id":2,"title":"Задача B","date":"03.01.2026","time":"09:00","status":0},` +
++		`{"id":3,"title":"Задача C","date":"05.01.2026","time":"08:00","status":0},` +
++		`{"id":1,"title":"Задача A","date":"05.01.2026","time":"10:00","status":0}]`
++	if json != want {
++		t.Fatalf("sort mismatch:\n got: %s\nwant: %s", json, want)
++	}
++}
++
++func TestUpdateAndDelete(t *testing.T) {
++	s := newTestService(t)
++	id, _ := s.AddTaskAndGetID("X", "01.01.2026", "12:00")
++
++	if err := s.UpdateTaskStatus(id, 1); err != nil {
++		t.Fatalf("update: %v", err)
++	}
++	if err := s.DeleteTask(id); err != nil {
++		t.Fatalf("delete: %v", err)
++	}
++	if json, _ := s.GetAllTasksSortedJSON(); json != "[]" {
++		t.Fatalf("expected empty, got %s", json)
++	}
++}
++
++// Воспроизводит сценарий AlarmActivity: второе подключение к той же БД
++// параллельно с основным сервисом ( MainActivity ).
++func TestConcurrentConnections(t *testing.T) {
++	dir := t.TempDir()
++	dbPath := filepath.Join(dir, "shared.db")
++
++	main, err := NewTodoService(dbPath)
++	if err != nil {
++		t.Fatalf("main service: %v", err)
++	}
++	defer main.Close()
++
++	id, err := main.AddTaskAndGetID("Параллельная запись", "01.01.2026", "12:00")
++	if err != nil {
++		t.Fatalf("seed: %v", err)
++	}
++
++	var wg sync.WaitGroup
++	errs := make(chan error, 20)
++	for i := 0; i < 10; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			second, err := NewTodoService(dbPath) // как в AlarmActivity
++			if err != nil {
++				errs <- err
++				return
++			}
++			defer second.Close()
++			if err := second.UpdateTaskStatus(id, 0); err != nil {
++				errs <- err
++			}
++		}()
++	}
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		t.Errorf("concurrent write: %v", err)
++	}
++}
