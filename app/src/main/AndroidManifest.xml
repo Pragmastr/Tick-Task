@@ -2,8 +2,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- Автоматически выдаётся будильным приложениям на Android 13+:
+         точные будильники срабатывают даже спустя годы после взвода. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Перезапуск всех будильников после перезагрузки телефона:
+         система стирает AlarmManager при выключении, без этого права
+         напоминания жили бы только до первого выключения устройства. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Циклическая вибрация будильника. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <application
 
         android:allowBackup="true"
@@ -33,12 +42,24 @@
             android:showForAllUsers="true"
             android:excludeFromRecents="true"
             android:launchMode="singleInstance"
+            android:screenOrientation="portrait"
             android:exported="false" />
         <receiver
             android:name=".AlarmReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="ACTION_LAUNCH_ALARM" />
+            </intent-filter>
+        </receiver>
+        <!-- Восстановление будильников после перезагрузки телефона и после
+             обновления приложения: задачи читаются из Go-ядра и взводятся заново. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>

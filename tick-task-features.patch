@@ -1,0 +1,2277 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 3b06927..d18127d 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -2,8 +2,17 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:tools="http://schemas.android.com/tools">
+     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
++    <!-- Автоматически выдаётся будильным приложениям на Android 13+:
++         точные будильники срабатывают даже спустя годы после взвода. -->
++    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
++    <!-- Перезапуск всех будильников после перезагрузки телефона:
++         система стирает AlarmManager при выключении, без этого права
++         напоминания жили бы только до первого выключения устройства. -->
++    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
++    <!-- Циклическая вибрация будильника. -->
++    <uses-permission android:name="android.permission.VIBRATE" />
+     <application
+ 
+         android:allowBackup="true"
+@@ -33,6 +42,7 @@
+             android:showForAllUsers="true"
+             android:excludeFromRecents="true"
+             android:launchMode="singleInstance"
++            android:screenOrientation="portrait"
+             android:exported="false" />
+         <receiver
+             android:name=".AlarmReceiver"
+@@ -41,6 +51,17 @@
+                 <action android:name="ACTION_LAUNCH_ALARM" />
+             </intent-filter>
+         </receiver>
++        <!-- Восстановление будильников после перезагрузки телефона и после
++             обновления приложения: задачи читаются из Go-ядра и взводятся заново. -->
++        <receiver
++            android:name=".BootReceiver"
++            android:exported="false">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
++                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
++            </intent-filter>
++        </receiver>
+     </application>
+ 
+-</manifest>
+\ No newline at end of file
++</manifest>
+diff --git a/app/src/main/java/com/example/elitetodo/AlarmActivity.kt b/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
+index a6bda44..5cb8ae9 100644
+--- a/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
++++ b/app/src/main/java/com/example/elitetodo/AlarmActivity.kt
+@@ -1,20 +1,44 @@
+ package com.example.elitetodo
+ 
+ import android.app.KeyguardManager
++import android.content.BroadcastReceiver
+ import android.content.Context
+ import android.content.Intent
++import android.content.IntentFilter
++import android.content.pm.ActivityInfo
+ import android.os.Build
+ import android.os.Bundle
+ import android.view.WindowManager
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.compose.runtime.Composable
++import androidx.core.content.ContextCompat
+ 
+ class AlarmActivity : ComponentActivity() {
+ 
++    companion object {
++        /** Внутренняя команда «выключить сигнал и закрыть экран будильника». */
++        const val ACTION_STOP_ALARM_UI = "com.example.elitetodo.ACTION_STOP_ALARM_UI"
++    }
++
++    private val stopReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context, intent: Intent) {
++            // Пользователь нажал «ВЫКЛЮЧИТЬ» в уведомлении, пока этот экран был открыт:
++            // глушим бесконечный сигнал и закрываемся.
++            AlarmSoundPlayer.stop()
++            finish()
++        }
++    }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+ 
++        // Блокируем поворот экрана: будильник всегда отображается портретно,
++        // даже на заблокированном экране и при включённом автоповороте системы.
++        // Дублируем манифестный android:screenOrientation="portrait" на случай,
++        // если активити пересоздастся системой в неожиданной ориентации.
++        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
++
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+             setShowWhenLocked(true)
+             setTurnScreenOn(true)
+@@ -29,18 +53,37 @@ class AlarmActivity : ComponentActivity() {
+                         WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+             )
+         }
++        // Экран будильника не гаснет, пока играет сигнал.
++        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+ 
+         val taskIdInt = intent.getStringExtra("alarm_task_id")?.toIntOrNull() ?: -1
+         val taskTitle = intent.getStringExtra("alarm_task_title") ?: "Задача"
+ 
+         android.util.Log.d("EliteTodoLOG", "AlarmActivity зажглась! ID = $taskIdInt, Заголовок = '$taskTitle'")
+ 
++        // Циклический бесконечный сигнал: мелодия и вибрация крутятся по кругу,
++        // пока пользователь не смахнёт экран вверх или не нажмёт «ВЫКЛЮЧИТЬ».
++        AlarmSoundPlayer.start(this)
++
++        // Уведомление заменяется на тихое: звук теперь ведёт этот экран,
++        // чтобы не было наложения двух сигналов. Кнопка «ВЫКЛЮЧИТЬ» остаётся в шторке.
++        AndroidAlarmManager.showSilentAlarmUiNotification(this, taskIdInt, taskTitle)
++
++        // Слушаем команду остановки, присланную из MainActivity (кнопка в шторке).
++        ContextCompat.registerReceiver(
++            this,
++            stopReceiver,
++            IntentFilter(ACTION_STOP_ALARM_UI),
++            ContextCompat.RECEIVER_NOT_EXPORTED
++        )
++
+         setContent {
+             AlarmActivityContent(taskTitle = taskTitle) {
+                 // Запись статуса "Выполнено", снятие уведомления и обновление UI целиком
+                 // делегируем MainActivity (ACTION_DISMISS_ALARM): у него уже открыт
+                 // единственный Go-сервис БД. Второе подключение отсюда ловило
+                 // SQLITE_BUSY ("database is locked") и дублировало запись статуса.
++                AlarmSoundPlayer.stop()
+                 val dismissIntent = Intent(this@AlarmActivity, MainActivity::class.java).apply {
+                     action = "ACTION_DISMISS_ALARM"
+                     putExtra("task_id", taskIdInt.toString())
+@@ -56,6 +99,15 @@ class AlarmActivity : ComponentActivity() {
+         }
+     }
+ 
++    override fun onDestroy() {
++        super.onDestroy()
++        try {
++            unregisterReceiver(stopReceiver)
++        } catch (_: Exception) {
++        }
++        // Страховка: сигнал не должен остаться играть после смерти активити.
++        AlarmSoundPlayer.stop()
++    }
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/com/example/elitetodo/AlarmSoundPlayer.kt b/app/src/main/java/com/example/elitetodo/AlarmSoundPlayer.kt
+new file mode 100644
+index 0000000..3f2c5af
+--- /dev/null
++++ b/app/src/main/java/com/example/elitetodo/AlarmSoundPlayer.kt
+@@ -0,0 +1,103 @@
++package com.example.elitetodo
++
++import android.content.Context
++import android.media.AudioAttributes
++import android.media.MediaPlayer
++import android.media.RingtoneManager
++import android.os.Build
++import android.os.VibrationEffect
++import android.os.Vibrator
++import android.os.VibratorManager
++import android.util.Log
++
++/**
++ * Циклический сигнал будильника.
++ *
++ * Мелодия запускается с isLooping = true — она повторяется БЕСКОНЕЧНО,
++ * пока пользователь не выключит будильник (свайп вверх по экрану будильника
++ * или кнопка «ВЫКЛЮЧИТЬ» в шторке). Вибрация тоже идёт повторяющимся
++ * паттерном без остановки. Раньше сигнал уведомления проигрывался один раз
++ * и замолкал — теперь будильник звонит до тех пор, пока его не выключат.
++ */
++object AlarmSoundPlayer {
++
++    private const val TAG = "AlarmSoundPlayer"
++
++    private var mediaPlayer: MediaPlayer? = null
++    private var vibrator: Vibrator? = null
++
++    fun start(context: Context) {
++        // Защита от двойного запуска: сперва глушим всё, что могло остаться играть.
++        stop()
++
++        try {
++            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
++                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
++                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
++
++            if (alarmUri != null) {
++                val player = MediaPlayer()
++                player.setAudioAttributes(
++                    AudioAttributes.Builder()
++                        .setUsage(AudioAttributes.USAGE_ALARM) // играем в громкости будильника, а не медиа
++                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++                        .build()
++                )
++                player.setDataSource(context, alarmUri)
++                // Ключевая строка: циклическое воспроизведение до бесконечности.
++                player.isLooping = true
++                player.prepare()
++                player.start()
++                mediaPlayer = player
++            }
++        } catch (e: Exception) {
++            Log.e(TAG, "Не удалось запустить циклический звук будильника: ${e.message}", e)
++        }
++
++        try {
++            val vib: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                val manager =
++                    context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
++                manager.defaultVibrator
++            } else {
++                @Suppress("DEPRECATION")
++                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
++            }
++            // Паттерн: 0мс пауза, 600мс вибрация, 800мс тишина; repeat = 0 — цикл с начала.
++            val pattern = longArrayOf(0, 600, 800)
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                vib.vibrate(VibrationEffect.createWaveform(pattern, 0))
++            } else {
++                @Suppress("DEPRECATION")
++                vib.vibrate(pattern, 0)
++            }
++            vibrator = vib
++        } catch (e: Exception) {
++            Log.e(TAG, "Не удалось запустить циклическую вибрацию: ${e.message}", e)
++        }
++    }
++
++    /** Глушит и звук, и вибрацию. Безопасно вызывать сколько угодно раз. */
++    fun stop() {
++        try {
++            mediaPlayer?.let { player ->
++                try {
++                    player.stop()
++                } catch (_: Exception) {
++                }
++                try {
++                    player.release()
++                } catch (_: Exception) {
++                }
++            }
++        } catch (_: Exception) {
++        }
++        mediaPlayer = null
++
++        try {
++            vibrator?.cancel()
++        } catch (_: Exception) {
++        }
++        vibrator = null
++    }
++}
+diff --git a/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt b/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
+index aa44b52..9facd02 100644
+--- a/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
++++ b/app/src/main/java/com/example/elitetodo/AndroidAlarmManager.kt
+@@ -19,6 +19,7 @@ import java.util.Locale
+ object AndroidAlarmManager {
+     private const val TAG = "AndroidAlarmManager"
+     private const val CHANNEL_ID = "todo_alarm_channel_v5"
++    private const val CHANNEL_UI_ID = "todo_alarm_ui_channel_v1"
+ 
+     fun scheduleNotification(context: Context, taskId: Int, title: String, dateStr: String, timeStr: String) {
+         try {
+@@ -114,6 +115,7 @@ object AndroidAlarmManager {
+                     val channel = NotificationChannel(CHANNEL_ID, "Будильник Списка Дел", importance).apply {
+                         description = "Уведомления точных будильников с кнопками управления"
+                         enableVibration(true)
++                        vibrationPattern = longArrayOf(0, 600, 800)
+ 
+                         val audioAttributes = AudioAttributes.Builder()
+                             .setUsage(AudioAttributes.USAGE_ALARM)
+@@ -157,11 +159,70 @@ object AndroidAlarmManager {
+                 .setFullScreenIntent(fullScreenPendingIntent, true)
+                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+ 
++            val notification = builder.build()
++            // FLAG_INSISTENT: система повторяет сигнал уведомления ПО КРУГУ бесконечно,
++            // пока уведомление не будет снято и пользователь не выключит будильник.
++            // Если полноэкранный интент сработал — экран будильника подменит это
++            // уведомление тихим и сам заведёт зацикленный MediaPlayer.
++            notification.flags = notification.flags or Notification.FLAG_INSISTENT
+ 
+-            notificationManager.notify(taskId + 1000, builder.build())
++            notificationManager.notify(taskId + 1000, notification)
+             Log.d(TAG, "[showAlarmNotification] Уведомление отправлено для ID: $taskId")
+         } catch (e: Exception) {
+             Log.e(TAG, "[Ошибка при показе пуша]: ${e.message}", e)
+         }
+     }
++
++    /**
++     * Тихая замена будильного уведомления. Вызывается из AlarmActivity, когда
++     * полноэкранный будильник уже играет собственный зацикленный сигнал:
++     * без неё уведомление продолжало бы звонить поверх экрана будильника.
++     * Уведомление остаётся в шторке с кнопкой «ВЫКЛЮЧИТЬ».
++     */
++    fun showSilentAlarmUiNotification(context: Context, taskId: Int, title: String) {
++        try {
++            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                if (notificationManager.getNotificationChannel(CHANNEL_UI_ID) == null) {
++                    val channel = NotificationChannel(
++                        CHANNEL_UI_ID,
++                        "Экран будильника",
++                        NotificationManager.IMPORTANCE_HIGH
++                    ).apply {
++                        description = "Показывается, пока экран будильника играет сигнал"
++                        setSound(null, null)
++                        enableVibration(false)
++                    }
++                    notificationManager.createNotificationChannel(channel)
++                }
++            }
++
++            val immutableFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++            val dismissIntent = Intent(context, MainActivity::class.java).apply {
++                action = "ACTION_DISMISS_ALARM"
++                putExtra("task_id", taskId.toString())
++                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
++            }
++            val dismissPending = PendingIntent.getActivity(context, taskId + 1000, dismissIntent, immutableFlags)
++
++            val appIconBitmap = android.graphics.BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
++            val builder = NotificationCompat.Builder(context, CHANNEL_UI_ID)
++                .setContentTitle("⏰ НАСТАЛО ВРЕМЯ ЗАДАЧИ")
++                .setContentText(title)
++                .setSmallIcon(R.drawable.ic_notification)
++                .setPriority(NotificationCompat.PRIORITY_MAX)
++                .setCategory(Notification.CATEGORY_ALARM)
++                .setLargeIcon(appIconBitmap)
++                .setAutoCancel(false)
++                .setOngoing(true)
++                .addAction(R.drawable.ic_notification, "ВЫКЛЮЧИТЬ", dismissPending)
++                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
++
++            notificationManager.notify(taskId + 1000, builder.build())
++            Log.d(TAG, "[showSilentAlarmUiNotification] Тихое уведомление для ID: $taskId")
++        } catch (e: Exception) {
++            Log.e(TAG, "[Ошибка тихого уведомления]: ${e.message}", e)
++        }
++    }
+ }
+diff --git a/app/src/main/java/com/example/elitetodo/BootReceiver.kt b/app/src/main/java/com/example/elitetodo/BootReceiver.kt
+new file mode 100644
+index 0000000..617f154
+--- /dev/null
++++ b/app/src/main/java/com/example/elitetodo/BootReceiver.kt
+@@ -0,0 +1,67 @@
++package com.example.elitetodo
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.util.Log
++import com.google.gson.Gson
++import com.google.gson.reflect.TypeToken
++import todo.Todo
++
++/**
++ * Восстанавливает все активные будильники после перезагрузки телефона или
++ * обновления приложения.
++ *
++ * Android стирает ВСЕ системные будильники (AlarmManager) при выключении —
++ * без этого ресивера напоминания умирали бы до первого запуска приложения.
++ * Теперь при каждой загрузке системы мы читаем бессрочный список задач
++ * из Go-ядра (SQLite) и взводим будильники заново: напоминание, созданное
++ * сегодня, сработает и через 10 лет — после любого числа перезагрузок.
++ */
++class BootReceiver : BroadcastReceiver() {
++
++    override fun onReceive(context: Context, intent: Intent) {
++        val action = intent.action ?: return
++        val isBoot = action == Intent.ACTION_BOOT_COMPLETED ||
++                action == "android.intent.action.QUICKBOOT_POWERON" ||
++                action == "android.intent.action.HTC_QUICKBOOT_POWERON"
++        val isUpdate = action == Intent.ACTION_MY_PACKAGE_REPLACED
++        if (!isBoot && !isUpdate) return
++
++        Log.d("BootReceiver", "Восстановление будильников после: $action")
++
++        try {
++            val dbPath = context.getDatabasePath("elite_final.db").absolutePath
++            val service = Todo.newTodoService(dbPath)
++            val json = try {
++                service.getAllTasksSortedJSON()
++            } finally {
++                try {
++                    service.close()
++                } catch (_: Exception) {
++                }
++            }
++
++            val type = object : TypeToken<List<TaskEntity>>() {}.type
++            val tasks: List<TaskEntity> = Gson().fromJson(json, type) ?: emptyList()
++
++            var armed = 0
++            for (task in tasks) {
++                if (task.status == 0) {
++                    // scheduleNotification сам пропустит задачи с прошедшей датой.
++                    AndroidAlarmManager.scheduleNotification(
++                        context,
++                        task.id,
++                        task.title,
++                        task.date,
++                        task.time
++                    )
++                    armed++
++                }
++            }
++            Log.d("BootReceiver", "Перевзведено будильников: $armed из ${tasks.size}")
++        } catch (e: Exception) {
++            Log.e("BootReceiver", "Ошибка восстановления будильников: ${e.message}", e)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/elitetodo/Database.kt b/app/src/main/java/com/example/elitetodo/Database.kt
+index 6e156b5..a4914e1 100644
+--- a/app/src/main/java/com/example/elitetodo/Database.kt
++++ b/app/src/main/java/com/example/elitetodo/Database.kt
+@@ -1,9 +1,12 @@
+-package com.example.elitetodo
+-
+-data class TaskEntity(
+-    val id: Int = 0,
+-    val title: String,
+-    val date: String,
+-    val time: String,
+-    val status: Int = 0
+-)
++package com.example.elitetodo
++
++data class TaskEntity(
++    val id: Int = 0,
++    val title: String,
++    val date: String,
++    val time: String,
++    val status: Int = 0,
++    // Категория хранится прямо в ядре (колонка category в SQLite).
++    // Пустая строка = «Без категории».
++    val category: String = ""
++)
+diff --git a/app/src/main/java/com/example/elitetodo/MainActivity.kt b/app/src/main/java/com/example/elitetodo/MainActivity.kt
+index bd2b596..e270e9e 100644
+--- a/app/src/main/java/com/example/elitetodo/MainActivity.kt
++++ b/app/src/main/java/com/example/elitetodo/MainActivity.kt
+@@ -1,9 +1,7 @@
+ package com.example.elitetodo
+ 
+ import android.Manifest
+-import android.app.DatePickerDialog
+ import android.app.NotificationManager
+-import android.app.TimePickerDialog
+ import android.content.Context
+ import android.content.Intent
+ import android.os.Build
+@@ -17,7 +15,6 @@ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.lifecycleScope
+ import com.google.gson.Gson
+ import com.google.gson.reflect.TypeToken
+@@ -69,9 +66,23 @@ class MainActivity : ComponentActivity() {
+ 
+                 var showAddDialog by remember { mutableStateOf(false) }
+                 var taskToDeleteId by remember { mutableStateOf<Int?>(null) }
++                var taskToEditId by remember { mutableStateOf<Int?>(null) }
++                var selectedCategory by remember { mutableStateOf<String?>(null) }
++
++                // Категории и фильтрация: список категорий берётся из ядра,
++                // выбранная категория оставляет на экране только её задачи.
++                val allCategories = tasksState.map { it.category }
++                    .filter { it.isNotBlank() }
++                    .distinct()
++                    .sorted()
++                val visibleTasks = if (selectedCategory == null) tasksState.toList()
++                else tasksState.filter { it.category == selectedCategory }
+ 
+                 TodoScreen(
+-                    tasks = tasksState,
++                    tasks = visibleTasks,
++                    categories = allCategories,
++                    selectedCategory = selectedCategory,
++                    onCategorySelected = { selectedCategory = it },
+                     onAddTaskClick = { showAddDialog = true },
+                     onTaskCheckedChange = { taskEntity, isChecked ->
+                         val status = if (isChecked) 1 else 0
+@@ -100,6 +111,7 @@ class MainActivity : ComponentActivity() {
+                             }
+                         }
+                     },
++                    onTaskEditClick = { taskEntity -> taskToEditId = taskEntity.id },
+                     onTaskMenuClick = { taskEntity -> taskToDeleteId = taskEntity.id }
+                 )
+ 
+@@ -144,110 +156,59 @@ class MainActivity : ComponentActivity() {
+                     )
+                 }
+ 
+-
++                // Диалог добавления задачи: те же поля, что и при редактировании.
+                 if (showAddDialog) {
+-                    var taskText by remember { mutableStateOf("") }
+                     val currentCal = Calendar.getInstance()
++                    TaskEditorDialog(
++                        title = "Новая цель",
++                        initialText = "",
++                        initialDate = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(currentCal.time),
++                        initialTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(currentCal.time),
++                        initialCategory = selectedCategory ?: "",
++                        knownCategories = allCategories,
++                        confirmLabel = "СОХРАНИТЬ",
++                        onSave = { text, date, time, category ->
++                            addTask(text, date, time, category)
++                            showAddDialog = false
++                        },
++                        onDismiss = { showAddDialog = false }
++                    )
++                }
+ 
+-                    var tempDate by remember {
+-                        mutableStateOf(
+-                            SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(
+-                                currentCal.time
+-                            )
+-                        )
+-                    }
+-                    var tempTime by remember {
+-                        mutableStateOf(
+-                            SimpleDateFormat("HH:mm", Locale.getDefault()).format(
+-                                currentCal.time
+-                            )
++                // Диалог редактирования: подставляется текущее содержимое задачи,
++                // по кнопке «ПРИМЕНИТЬ» задача переписывается в ядре, а будильник
++                // перевзводится на новое время.
++                taskToEditId?.let { editId ->
++                    tasksState.firstOrNull { it.id == editId }?.let { task ->
++                        TaskEditorDialog(
++                            title = "Редактирование",
++                            initialText = task.title,
++                            initialDate = task.date,
++                            initialTime = task.time,
++                            initialCategory = task.category,
++                            knownCategories = (allCategories + task.category)
++                                .filter { it.isNotBlank() }
++                                .distinct()
++                                .sorted(),
++                            confirmLabel = "ПРИМЕНИТЬ",
++                            onSave = { text, date, time, category ->
++                                editTask(task, text, date, time, category)
++                                taskToEditId = null
++                            },
++                            onDismiss = { taskToEditId = null }
+                         )
+                     }
+-
+-                    AlertDialog(
+-                        onDismissRequest = { showAddDialog = false },
+-                        containerColor = MaterialTheme.colorScheme.surface,
+-                        title = { Text("Новая цель") },
+-                        text = {
+-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+-                                OutlinedTextField(
+-                                    value = taskText,
+-                                    onValueChange = { taskText = it },
+-                                    label = { Text("Что планируем?") },
+-                                    modifier = Modifier.fillMaxWidth()
+-                                )
+-                                Text(
+-                                    text = "Запланировано на: $tempDate в $tempTime",
+-                                    style = MaterialTheme.typography.bodySmall
+-                                )
+-                            }
+-                        },
+-                        confirmButton = {
+-                            Button(onClick = {
+-                                if (taskText.trim().isNotEmpty()) {
+-                                    addTask(taskText.trim(), tempDate, tempTime)
+-                                    showAddDialog = false
+-                                }
+-                            }) {
+-                                Text("СОХРАНИТЬ")
+-                            }
+-                        },
+-                        dismissButton = {
+-                            Row {
+-                                TextButton(onClick = {
+-                                    DatePickerDialog(
+-                                        this@MainActivity,
+-                                        { _, year, month, dayOfMonth ->
+-                                            val cal = Calendar.getInstance().apply {
+-                                                set(Calendar.YEAR, year)
+-                                                set(Calendar.MONTH, month)
+-                                                set(Calendar.DAY_OF_MONTH, dayOfMonth)
+-                                            }
+-                                            tempDate = SimpleDateFormat(
+-                                                "dd.MM.yyyy",
+-                                                Locale.getDefault()
+-                                            ).format(cal.time)
+-                                        },
+-                                        currentCal.get(Calendar.YEAR),
+-                                        currentCal.get(Calendar.MONTH),
+-                                        currentCal.get(Calendar.DAY_OF_MONTH)
+-                                    ).show()
+-                                }) {
+-                                    Text("ДАТА")
+-                                }
+-
+-                                TextButton(onClick = {
+-                                    TimePickerDialog(
+-                                        this@MainActivity,
+-                                        { _, hourOfDay, minute ->
+-                                            val cal = Calendar.getInstance().apply {
+-                                                set(Calendar.HOUR_OF_DAY, hourOfDay)
+-                                                set(Calendar.MINUTE, minute)
+-                                            }
+-                                            tempTime = SimpleDateFormat(
+-                                                "HH:mm",
+-                                                Locale.getDefault()
+-                                            ).format(cal.time)
+-                                        },
+-                                        currentCal.get(Calendar.HOUR_OF_DAY),
+-                                        currentCal.get(Calendar.MINUTE),
+-                                        true
+-                                    ).show()
+-                                }) {
+-                                    Text("ВРЕМЯ")
+-                                }
+-                            }
+-                        }
+-                    )
+                 }
+             }
+         }
+     }
+-    private fun addTask(text: String, date: String, time: String) {
++
++    private fun addTask(text: String, date: String, time: String, category: String) {
+         lifecycleScope.launch(Dispatchers.IO) {
+             try {
+                 // Вся логика форматирования дат и инсерта ушла в Go-слой
+-                val insertedId = goTodoService?.addTaskAndGetID(text, date, time) ?: -1L
++                val insertedId = goTodoService
++                    ?.addTaskWithCategoryAndGetID(text, date, time, category) ?: -1L
+ 
+                 if (insertedId != -1L) {
+                     // Системный будильник по-прежнему взводим на уровне Kotlin
+@@ -263,6 +224,29 @@ class MainActivity : ComponentActivity() {
+         }
+     }
+ 
++    private fun editTask(original: TaskEntity, text: String, date: String, time: String, category: String) {
++        lifecycleScope.launch(Dispatchers.IO) {
++            try {
++                // Редактирование целиком уходит в Go-ядро: title, date, time и category
++                // переписываются одной операцией, ID и статус задачи сохраняются.
++                goTodoService?.updateTask(original.id.toLong(), text, date, time, category)
++
++                // Будильник обязан следовать за новым временем: снимаем старый
++                // и взводим новый. Выполненную задачу не будим.
++                AndroidAlarmManager.cancelAllForTask(this@MainActivity, original.id)
++                if (original.status == 0) {
++                    AndroidAlarmManager.scheduleNotification(this@MainActivity, original.id, text, date, time)
++                }
++
++                withContext(Dispatchers.Main) {
++                    refreshUi()
++                }
++            } catch (e: Exception) {
++                Log.e(TAG, "Ошибка редактирования задачи через Go: ${e.message}")
++            }
++        }
++    }
++
+     private fun refreshUi() {
+         lifecycleScope.launch(Dispatchers.IO) {
+             try {
+@@ -308,10 +292,17 @@ class MainActivity : ComponentActivity() {
+                 val taskId = taskIdStr.toIntOrNull() ?: -1
+                 Log.d("EliteTodoLOG", "Свайп / Выключение! ID: $taskId")
+ 
++                // Глушим циклический сигнал и закрываем экран будильника,
++                // если он был открыт (например, выключали кнопкой из шторки).
++                AlarmSoundPlayer.stop()
++                sendBroadcast(
++                    Intent(AlarmActivity.ACTION_STOP_ALARM_UI).setPackage(packageName)
++                )
++
+                 if (taskId != -1 && taskId != 0) {
+                     lifecycleScope.launch(Dispatchers.IO) {
+                         try {
+-                            // ИСПРАВЛЕНО: ПриводимtaskId и статус к типу Long с помощью .toLong()
++                            // Приводим taskId и статус к типу Long с помощью .toLong()
+                             goTodoService?.updateTaskStatus(taskId.toLong(), 1L)
+                             Log.d("EliteTodoLOG", "БД Go: Записан статус 'Выполнено' для ID = $taskId")
+ 
+diff --git a/app/src/main/java/com/example/elitetodo/TaskEditorDialog.kt b/app/src/main/java/com/example/elitetodo/TaskEditorDialog.kt
+new file mode 100644
+index 0000000..b84aa15
+--- /dev/null
++++ b/app/src/main/java/com/example/elitetodo/TaskEditorDialog.kt
+@@ -0,0 +1,166 @@
++package com.example.elitetodo
++
++import android.app.DatePickerDialog
++import android.app.TimePickerDialog
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.AssistChip
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import java.text.SimpleDateFormat
++import java.util.Calendar
++import java.util.Locale
++
++/**
++ * Единый диалог создания и редактирования задачи.
++ *
++ * Для редактирования в него просто передаётся текущее содержимое задачи:
++ * текст, дата, время и категория подставляются в поля автоматически.
++ * Категория — произвольный текст; чипсы ниже поля подсказывают уже
++ * использованные категории, чтобы не плодить дубли («Работа» / «работа»).
++ */
++@Composable
++fun TaskEditorDialog(
++    title: String,
++    initialText: String,
++    initialDate: String,
++    initialTime: String,
++    initialCategory: String,
++    knownCategories: List<String>,
++    confirmLabel: String,
++    onSave: (text: String, date: String, time: String, category: String) -> Unit,
++    onDismiss: () -> Unit
++) {
++    val context = LocalContext.current
++
++    var taskText by remember { mutableStateOf(initialText) }
++    var tempDate by remember { mutableStateOf(initialDate) }
++    var tempTime by remember { mutableStateOf(initialTime) }
++    var category by remember { mutableStateOf(initialCategory) }
++
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        containerColor = MaterialTheme.colorScheme.surface,
++        title = { Text(title) },
++        text = {
++            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                OutlinedTextField(
++                    value = taskText,
++                    onValueChange = { taskText = it },
++                    label = { Text("Что планируем?") },
++                    modifier = Modifier.fillMaxWidth()
++                )
++                OutlinedTextField(
++                    value = category,
++                    onValueChange = { category = it },
++                    label = { Text("Категория (необязательно)") },
++                    singleLine = true,
++                    modifier = Modifier.fillMaxWidth()
++                )
++                if (knownCategories.isNotEmpty()) {
++                    Row(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .horizontalScroll(rememberScrollState()),
++                        horizontalArrangement = Arrangement.spacedBy(8.dp)
++                    ) {
++                        knownCategories.forEach { cat ->
++                            AssistChip(
++                                onClick = { category = cat },
++                                label = { Text(cat, fontSize = 13.sp) }
++                            )
++                        }
++                    }
++                }
++                Text(
++                    text = "Запланировано на: $tempDate в $tempTime",
++                    style = MaterialTheme.typography.bodySmall
++                )
++            }
++        },
++        confirmButton = {
++            Button(onClick = {
++                if (taskText.trim().isNotEmpty()) {
++                    onSave(taskText.trim(), tempDate, tempTime, category.trim())
++                }
++            }) {
++                Text(confirmLabel)
++            }
++        },
++        dismissButton = {
++            Row {
++                TextButton(onClick = {
++                    val current = try {
++                        Calendar.getInstance().apply {
++                            time = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).parse(tempDate)!!
++                        }
++                    } catch (_: Exception) {
++                        Calendar.getInstance()
++                    }
++                    DatePickerDialog(
++                        context,
++                        { _, year, month, dayOfMonth ->
++                            val cal = Calendar.getInstance().apply {
++                                set(Calendar.YEAR, year)
++                                set(Calendar.MONTH, month)
++                                set(Calendar.DAY_OF_MONTH, dayOfMonth)
++                            }
++                            tempDate = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(cal.time)
++                        },
++                        current.get(Calendar.YEAR),
++                        current.get(Calendar.MONTH),
++                        current.get(Calendar.DAY_OF_MONTH)
++                    ).show()
++                }) {
++                    Text("ДАТА")
++                }
++
++                TextButton(onClick = {
++                    val current = try {
++                        Calendar.getInstance().apply {
++                            time = SimpleDateFormat("HH:mm", Locale.getDefault()).parse(tempTime)!!
++                        }
++                    } catch (_: Exception) {
++                        Calendar.getInstance()
++                    }
++                    TimePickerDialog(
++                        context,
++                        { _, hourOfDay, minute ->
++                            val cal = Calendar.getInstance().apply {
++                                set(Calendar.HOUR_OF_DAY, hourOfDay)
++                                set(Calendar.MINUTE, minute)
++                            }
++                            tempTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(cal.time)
++                        },
++                        current.get(Calendar.HOUR_OF_DAY),
++                        current.get(Calendar.MINUTE),
++                        true
++                    ).show()
++                }) {
++                    Text("ВРЕМЯ")
++                }
++
++                TextButton(onClick = onDismiss) {
++                    Text("ОТМЕНА")
++                }
++            }
++        }
++    )
++}
+diff --git a/app/src/main/java/com/example/elitetodo/TodoComponents.kt b/app/src/main/java/com/example/elitetodo/TodoComponents.kt
+index 8643f7e..ce0a9d3 100644
+--- a/app/src/main/java/com/example/elitetodo/TodoComponents.kt
++++ b/app/src/main/java/com/example/elitetodo/TodoComponents.kt
+@@ -2,13 +2,17 @@ package com.example.elitetodo
+ 
+ 
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.horizontalScroll
+ import androidx.compose.foundation.layout.*
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Add
+ import androidx.compose.material.icons.filled.CheckCircle
+ import androidx.compose.material.icons.filled.DateRange
++import androidx.compose.material.icons.filled.Edit
+ import androidx.compose.material.icons.filled.MoreVert
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.Composable
+@@ -18,6 +22,7 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.text.style.TextDecoration
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+@@ -26,10 +31,28 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.setValue
+ 
+ 
++private val categoryPalette = listOf(
++    Color(0xFF5C6BC0), // индиго
++    Color(0xFF26A69A), // бирюза
++    Color(0xFFEF6C00), // оранжевый
++    Color(0xFF8E24AA), // фиолетовый
++    Color(0xFF43A047), // зелёный
++    Color(0xFFD81B60), // розовый
++    Color(0xFF1E88E5), // синий
++    Color(0xFF6D4C41)  // коричневый
++)
++
++/** Стабильный цвет категории: одинаков при каждом запуске приложения. */
++fun categoryColor(name: String): Color {
++    val hash = name.hashCode().let { if (it < 0) it.inv() else it }
++    return categoryPalette[hash % categoryPalette.size]
++}
++
+ @Composable
+ fun TaskItem(
+     task: TaskEntity,
+     onCheckboxClick: (Boolean) -> Unit,
++    onEditClick: () -> Unit,
+     onMenuClick: () -> Unit
+ ) {
+     val isTaskDone = task.status == 1
+@@ -64,6 +87,24 @@ fun TaskItem(
+                 textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None,
+                 color = if (isTaskDone) Color.Gray else Color.Black
+             )
++
++            // Бейдж категории: цветная метка, привязанная к категории из ядра
++            if (task.category.isNotBlank()) {
++                Surface(
++                    color = categoryColor(task.category).copy(alpha = 0.12f),
++                    contentColor = categoryColor(task.category),
++                    shape = RoundedCornerShape(6.dp),
++                    modifier = Modifier.padding(top = 2.dp)
++                ) {
++                    Text(
++                        text = task.category,
++                        fontSize = 12.sp,
++                        fontWeight = FontWeight.Medium,
++                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
++                    )
++                }
++            }
++
+             val secondaryText = "${task.date} в ${task.time}"
+             if (secondaryText.trim().isNotEmpty())  {
+                 Text(
+@@ -91,10 +132,9 @@ fun TaskItem(
+ 
+             Spacer(modifier = Modifier.width(4.dp))
+ 
+-            // ИСПРАВЛЕНО: Добавлен Box, чтобы меню знало координаты этой кнопки
+             Box {
+                 IconButton(
+-                    onClick = { menuExpanded = true }, // При клике открываем локальное меню
++                    onClick = { menuExpanded = true },
+                     modifier = Modifier.size(24.dp)
+                 ) {
+                     Icon(
+@@ -104,17 +144,37 @@ fun TaskItem(
+                     )
+                 }
+ 
+-                // ИСПРАВЛЕНО: Выпадающее меню теперь привязано к этой кнопке
+                 DropdownMenu(
+                     expanded = menuExpanded,
+                     onDismissRequest = { menuExpanded = false },
+                     modifier = Modifier.background(com.example.elitetodo.ui.theme.SoftLightBlue)
+                 ) {
++                    DropdownMenuItem(
++                        text = { Text("Редактировать") },
++                        leadingIcon = {
++                            Icon(
++                                imageVector = Icons.Default.Edit,
++                                contentDescription = "Edit",
++                                modifier = Modifier.size(20.dp)
++                            )
++                        },
++                        onClick = {
++                            menuExpanded = false
++                            onEditClick()
++                        }
++                    )
+                     DropdownMenuItem(
+                         text = { Text("Удалить") },
++                        leadingIcon = {
++                            Icon(
++                                imageVector = Icons.Default.MoreVert,
++                                contentDescription = "Delete",
++                                modifier = Modifier.size(20.dp)
++                            )
++                        },
+                         onClick = {
+                             menuExpanded = false
+-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
++                            onMenuClick()
+                         }
+                     )
+                 }
+@@ -127,24 +187,65 @@ fun TaskItem(
+ @Composable
+ fun TodoScreen(
+     tasks: List<TaskEntity>,
++    categories: List<String>,
++    selectedCategory: String?,
++    onCategorySelected: (String?) -> Unit,
+     onAddTaskClick: () -> Unit,
+     onTaskCheckedChange : (TaskEntity, Boolean) -> Unit,
++    onTaskEditClick: (TaskEntity) -> Unit,
+     onTaskMenuClick: (TaskEntity) -> Unit
+ ) {
+     Scaffold(
+         modifier = Modifier.background(Color.White),
+         containerColor = Color.White,
+         topBar = {
+-            TopAppBar(
+-                title = {
+-                    Text(
+-                        text = "Tick-Task", // Добавили ваше новое название!
+-                        fontWeight = FontWeight.Normal,
+-                        color = Color.Black
+-                    )
+-                },
+-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+-            )
++            Column {
++                TopAppBar(
++                    title = {
++                        Text(
++                            text = "Tick-Task",
++                            fontWeight = FontWeight.Normal,
++                            color = Color.Black
++                        )
++                    },
++                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
++                )
++
++                // Лента категорий-фильтров: «Все» + категории, встречающиеся в задачах.
++                if (categories.isNotEmpty()) {
++                    Row(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .horizontalScroll(rememberScrollState())
++                            .padding(horizontal = 16.dp, vertical = 4.dp),
++                        horizontalArrangement = Arrangement.spacedBy(8.dp)
++                    ) {
++                        FilterChip(
++                            selected = selectedCategory == null,
++                            onClick = { onCategorySelected(null) },
++                            label = { Text("Все") }
++                        )
++                        categories.forEach { cat ->
++                            FilterChip(
++                                selected = selectedCategory == cat,
++                                onClick = {
++                                    // Повторный тап по выбранной категории возвращает «Все»
++                                    onCategorySelected(if (selectedCategory == cat) null else cat)
++                                },
++                                label = {
++                                    Text(
++                                        text = cat,
++                                        color = if (selectedCategory == cat)
++                                            MaterialTheme.colorScheme.primary
++                                        else
++                                            categoryColor(cat)
++                                    )
++                                }
++                            )
++                        }
++                    }
++                }
++            }
+         },
+         floatingActionButton = {
+             FloatingActionButton(
+@@ -164,13 +265,30 @@ fun TodoScreen(
+                 .padding(innerPadding),
+             verticalArrangement = Arrangement.spacedBy(8.dp)
+         ) {
++            if (tasks.isEmpty()) {
++                item {
++                    Text(
++                        text = if (selectedCategory == null)
++                            "Здесь пока пусто.\nНажмите «+», чтобы добавить цель."
++                        else
++                            "В категории «$selectedCategory» задач нет.",
++                        color = Color.Gray,
++                        fontSize = 15.sp,
++                        textAlign = TextAlign.Center,
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(top = 48.dp)
++                    )
++                }
++            }
+             items(tasks, key = { it.id }) { task ->
+                 TaskItem(
+                     task = task,
+                     onCheckboxClick = { isChecked -> onTaskCheckedChange(task, isChecked) },
++                    onEditClick = { onTaskEditClick(task) },
+                     onMenuClick = { onTaskMenuClick(task) }
+                 )
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/gonative/todo/todo.go b/gonative/todo/todo.go
+index 29deb82..6faeaf5 100644
+--- a/gonative/todo/todo.go
++++ b/gonative/todo/todo.go
+@@ -1,140 +1,208 @@
+ package todo
+ 
+ import (
+-	"database/sql"
+-	"encoding/json"
+-	"fmt"
+-	"strings"
++        "database/sql"
++        "encoding/json"
++        "fmt"
++        "strings"
+ 
+-	_ "modernc.org/sqlite" // Pure Go драйвер без CGO, идеален для Android
++        _ "modernc.org/sqlite" // Pure Go драйвер без CGO, идеален для Android
+ )
+ 
+-// TaskEntity полностью дублирует структуру данных для UI
++// TaskEntity полностью дублирует структуру данных для UI.
++// Category — произвольная текстовая метка ("Работа", "Дом", ...).
++// Пустая строка означает "Без категории". Хранится в ядре бессрочно,
++// как и сама задача: ядро ничего не удаляет и не "забывает".
+ type TaskEntity struct {
+-	ID     int    `json:"id"`
+-	Title  string `json:"title"`
+-	Date   string `json:"date"`
+-	Time   string `json:"time"`
+-	Status int    `json:"status"`
++        ID       int    `json:"id"`
++        Title    string `json:"title"`
++        Date     string `json:"date"`
++        Time     string `json:"time"`
++        Status   int    `json:"status"`
++        Category string `json:"category"`
+ }
+ 
+ // TodoService — главный компонент бизнес-логики приложения
+ type TodoService struct {
+-	db *sql.DB
++        db *sql.DB
+ }
+ 
+ // NewTodoService открывает базу данных и готовит таблицы. Прогрев происходит атомарно.
+ func NewTodoService(dbPath string) (*TodoService, error) {
+-	// busy_timeout заставляет ждущие соединения дожидаться снятия блокировки
+-	// вместо мгновенного SQLITE_BUSY; WAL разрешает чтение во время записи.
+-	dsn := "file:" + dbPath + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
+-	db, err := sql.Open("sqlite", dsn)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to open database: %w", err)
+-	}
+-
+-	// Сериализуем доступ внутри процесса: один писатель — нет взаимных блокировок.
+-	db.SetMaxOpenConns(1)
+-	db.SetMaxIdleConns(1)
+-
+-	service := &TodoService{db: db}
+-	if err := service.createTables(); err != nil {
+-		db.Close()
+-		return nil, err
+-	}
+-
+-	return service, nil
++        // busy_timeout заставляет ждущие соединения дожидаться снятия блокировки
++        // вместо мгновенного SQLITE_BUSY; WAL разрешает чтение во время записи.
++        dsn := "file:" + dbPath + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
++        db, err := sql.Open("sqlite", dsn)
++        if err != nil {
++                return nil, fmt.Errorf("failed to open database: %w", err)
++        }
++
++        // Сериализуем доступ внутри процесса: один писатель — нет взаимных блокировок.
++        db.SetMaxOpenConns(1)
++        db.SetMaxIdleConns(1)
++
++        service := &TodoService{db: db}
++        if err := service.createTables(); err != nil {
++                db.Close()
++                return nil, err
++        }
++
++        return service, nil
+ }
+ 
+ func (s *TodoService) createTables() error {
+-	query := `
+-	CREATE TABLE IF NOT EXISTS "tasks" (
+-		"id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+-		"title" TEXT NOT NULL,
+-		"date" TEXT NOT NULL,
+-		"time" TEXT NOT NULL,
+-		"status" INTEGER NOT NULL
+-	);`
+-	_, err := s.db.Exec(query)
+-	return err
++        // Свежая схема сразу содержит колонку category.
++        query := `
++        CREATE TABLE IF NOT EXISTS "tasks" (
++                "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
++                "title" TEXT NOT NULL,
++                "date" TEXT NOT NULL,
++                "time" TEXT NOT NULL,
++                "status" INTEGER NOT NULL,
++                "category" TEXT NOT NULL DEFAULT ''
++        );`
++        if _, err := s.db.Exec(query); err != nil {
++                return err
++        }
++        // Базы, созданные прошлыми версиями приложения, продолжают жить дальше:
++        // миграция достраивает недостающие колонки, данные не теряются никогда.
++        return s.migrate()
++}
++
++// migrate идемпотентно достраивает схему до актуальной.
++func (s *TodoService) migrate() error {
++        rows, err := s.db.Query(`SELECT name FROM pragma_table_info('tasks')`)
++        if err != nil {
++                return err
++        }
++        existing := map[string]bool{}
++        for rows.Next() {
++                var name string
++                if err := rows.Scan(&name); err != nil {
++                        rows.Close()
++                        return err
++                }
++                existing[name] = true
++        }
++        rows.Close()
++        if err := rows.Err(); err != nil {
++                return err
++        }
++
++        if !existing["category"] {
++                if _, err := s.db.Exec(`ALTER TABLE "tasks" ADD COLUMN "category" TEXT NOT NULL DEFAULT ''`); err != nil {
++                        return err
++                }
++        }
++        return nil
+ }
+ 
+ // GetAllTasksSortedJSON возвращает отсортированный JSON-список задач.
+ func (s *TodoService) GetAllTasksSortedJSON() (string, error) {
+-	query := `
+-		SELECT id, title, date, time, status FROM tasks
+-		ORDER BY status ASC,
+-		SUBSTR(date, 7, 4) || '-' || SUBSTR(date, 4, 2) || '-' || SUBSTR(date, 1, 2) ASC,
+-		time ASC
+-	`
+-	rows, err := s.db.Query(query)
+-	if err != nil {
+-		return "", err
+-	}
+-	defer rows.Close()
+-
+-	tasks := []TaskEntity{}
+-	for rows.Next() {
+-		var t TaskEntity
+-		if err := rows.Scan(&t.ID, &t.Title, &t.Date, &t.Time, &t.Status); err != nil {
+-			return "", err
+-		}
+-		tasks = append(tasks, t)
+-	}
+-
+-	if err := rows.Err(); err != nil {
+-		return "", err
+-	}
+-
+-	if len(tasks) == 0 {
+-		return "[]", nil
+-	}
+-
+-	jsonData, err := json.Marshal(tasks)
+-	if err != nil {
+-		return "", err
+-	}
+-	return string(jsonData), nil
++        query := `
++                SELECT id, title, date, time, status, category FROM tasks
++                ORDER BY status ASC,
++                SUBSTR(date, 7, 4) || '-' || SUBSTR(date, 4, 2) || '-' || SUBSTR(date, 1, 2) ASC,
++                time ASC
++        `
++        rows, err := s.db.Query(query)
++        if err != nil {
++                return "", err
++        }
++        defer rows.Close()
++
++        tasks := []TaskEntity{}
++        for rows.Next() {
++                var t TaskEntity
++                if err := rows.Scan(&t.ID, &t.Title, &t.Date, &t.Time, &t.Status, &t.Category); err != nil {
++                        return "", err
++                }
++                tasks = append(tasks, t)
++        }
++
++        if err := rows.Err(); err != nil {
++                return "", err
++        }
++
++        if len(tasks) == 0 {
++                return "[]", nil
++        }
++
++        jsonData, err := json.Marshal(tasks)
++        if err != nil {
++                return "", err
++        }
++        return string(jsonData), nil
++}
++
++// normalizeDate приводит дату к каноничному формату дд.ММ.гггг.
++func normalizeDate(dateStr string) string {
++        if strings.Contains(dateStr, "-") {
++                parts := strings.Split(dateStr, "-")
++                if len(parts) == 3 {
++                        return fmt.Sprintf("%s.%s.%s", parts[2], parts[1], parts[0])
++                }
++        }
++        return dateStr
+ }
+ 
+-// AddTaskAndGetID нормализует дату и сохраняет новую задачу, возвращая сгенерированный ID
++// AddTaskAndGetID сохраняет новую задачу без категории, возвращая сгенерированный ID.
++// Оставлен для совместимости со старыми вызовами.
+ func (s *TodoService) AddTaskAndGetID(title string, dateStr string, timeStr string) (int, error) {
+-	if strings.Contains(dateStr, "-") {
+-		parts := strings.Split(dateStr, "-")
+-		if len(parts) == 3 {
+-			dateStr = fmt.Sprintf("%s.%s.%s", parts[2], parts[1], parts[0])
+-		}
+-	}
+-
+-	query := "INSERT INTO tasks (title, date, time, status) VALUES (?, ?, ?, 0)"
+-	res, err := s.db.Exec(query, title, dateStr, timeStr)
+-	if err != nil {
+-		return 0, err
+-	}
+-
+-	id, err := res.LastInsertId()
+-	if err != nil {
+-		return 0, err
+-	}
+-
+-	return int(id), nil
++        return s.AddTaskWithCategoryAndGetID(title, dateStr, timeStr, "")
++}
++
++// AddTaskWithCategoryAndGetID нормализует дату и сохраняет новую задачу
++// вместе с категорией, возвращая сгенерированный ID.
++func (s *TodoService) AddTaskWithCategoryAndGetID(title string, dateStr string, timeStr string, category string) (int, error) {
++        dateStr = normalizeDate(dateStr)
++
++        query := "INSERT INTO tasks (title, date, time, status, category) VALUES (?, ?, ?, 0, ?)"
++        res, err := s.db.Exec(query, title, dateStr, timeStr, strings.TrimSpace(category))
++        if err != nil {
++                return 0, err
++        }
++
++        id, err := res.LastInsertId()
++        if err != nil {
++                return 0, err
++        }
++
++        return int(id), nil
++}
++
++// UpdateTask полностью переписывает содержимое задачи (функция редактирования).
++// Дата нормализуется так же, как при создании. Статус и ID не трогаются.
++func (s *TodoService) UpdateTask(id int, title string, dateStr string, timeStr string, category string) error {
++        dateStr = normalizeDate(dateStr)
++
++        query := "UPDATE tasks SET title = ?, date = ?, time = ?, category = ? WHERE id = ?"
++        _, err := s.db.Exec(query, title, dateStr, timeStr, strings.TrimSpace(category), id)
++        return err
++}
++
++// UpdateTaskCategory меняет только категорию задачи.
++func (s *TodoService) UpdateTaskCategory(id int, category string) error {
++        query := "UPDATE tasks SET category = ? WHERE id = ?"
++        _, err := s.db.Exec(query, strings.TrimSpace(category), id)
++        return err
+ }
+ 
+ // UpdateTaskStatus обновляет статус выполнения задачи
+ func (s *TodoService) UpdateTaskStatus(id int, status int) error {
+-	query := "UPDATE tasks SET status = ? WHERE id = ?"
+-	_, err := s.db.Exec(query, status, id)
+-	return err
++        query := "UPDATE tasks SET status = ? WHERE id = ?"
++        _, err := s.db.Exec(query, status, id)
++        return err
+ }
+ 
+ // DeleteTask полностью удаляет задачу из базы
+ func (s *TodoService) DeleteTask(id int) error {
+-	query := "DELETE FROM tasks WHERE id = ?"
+-	_, err := s.db.Exec(query, id)
+-	return err
++        query := "DELETE FROM tasks WHERE id = ?"
++        _, err := s.db.Exec(query, id)
++        return err
+ }
+ 
+ // Close безопасно закрывает дескриптор базы данных
+ func (s *TodoService) Close() error {
+-	return s.db.Close()
++        return s.db.Close()
+ }
+diff --git a/gonative/todo/todo_test.go b/gonative/todo/todo_test.go
+index fefd267..d27195b 100644
+--- a/gonative/todo/todo_test.go
++++ b/gonative/todo/todo_test.go
+@@ -1,100 +1,240 @@
+ package todo
+ 
+ import (
+-	"path/filepath"
+-	"sync"
+-	"testing"
++        "database/sql"
++        "path/filepath"
++        "sync"
++        "testing"
++
++        _ "modernc.org/sqlite"
+ )
+ 
+ func newTestService(t *testing.T) *TodoService {
+-	t.Helper()
+-	dir := t.TempDir()
+-	s, err := NewTodoService(filepath.Join(dir, "test.db"))
+-	if err != nil {
+-		t.Fatalf("NewTodoService: %v", err)
+-	}
+-	t.Cleanup(func() { s.Close() })
+-	return s
++        t.Helper()
++        dir := t.TempDir()
++        s, err := NewTodoService(filepath.Join(dir, "test.db"))
++        if err != nil {
++                t.Fatalf("NewTodoService: %v", err)
++        }
++        t.Cleanup(func() { s.Close() })
++        return s
+ }
+ 
+ func TestAddAndGetSorted(t *testing.T) {
+-	s := newTestService(t)
+-
+-	id1, err := s.AddTaskAndGetID("Задача A", "05.01.2026", "10:00")
+-	if err != nil || id1 != 1 {
+-		t.Fatalf("add A: id=%d err=%v", id1, err)
+-	}
+-	if _, err := s.AddTaskAndGetID("Задача B", "2026-01-03", "09:00"); err != nil {
+-		t.Fatalf("add B: %v", err)
+-	}
+-	if _, err := s.AddTaskAndGetID("Задача C", "05.01.2026", "08:00"); err != nil {
+-		t.Fatalf("add C: %v", err)
+-	}
+-
+-	json, err := s.GetAllTasksSortedJSON()
+-	if err != nil {
+-		t.Fatalf("all: %v", err)
+-	}
+-	want := `[{"id":2,"title":"Задача B","date":"03.01.2026","time":"09:00","status":0},` +
+-		`{"id":3,"title":"Задача C","date":"05.01.2026","time":"08:00","status":0},` +
+-		`{"id":1,"title":"Задача A","date":"05.01.2026","time":"10:00","status":0}]`
+-	if json != want {
+-		t.Fatalf("sort mismatch:\n got: %s\nwant: %s", json, want)
+-	}
++        s := newTestService(t)
++
++        id1, err := s.AddTaskAndGetID("Задача A", "05.01.2026", "10:00")
++        if err != nil || id1 != 1 {
++                t.Fatalf("add A: id=%d err=%v", id1, err)
++        }
++        if _, err := s.AddTaskAndGetID("Задача B", "2026-01-03", "09:00"); err != nil {
++                t.Fatalf("add B: %v", err)
++        }
++        if _, err := s.AddTaskAndGetID("Задача C", "05.01.2026", "08:00"); err != nil {
++                t.Fatalf("add C: %v", err)
++        }
++
++        json, err := s.GetAllTasksSortedJSON()
++        if err != nil {
++                t.Fatalf("all: %v", err)
++        }
++        want := `[{"id":2,"title":"Задача B","date":"03.01.2026","time":"09:00","status":0,"category":""},` +
++                `{"id":3,"title":"Задача C","date":"05.01.2026","time":"08:00","status":0,"category":""},` +
++                `{"id":1,"title":"Задача A","date":"05.01.2026","time":"10:00","status":0,"category":""}]`
++        if json != want {
++                t.Fatalf("sort mismatch:\n got: %s\nwant: %s", json, want)
++        }
++}
++
++func TestAddWithCategory(t *testing.T) {
++        s := newTestService(t)
++
++        _, err := s.AddTaskWithCategoryAndGetID("Отчёт", "05.01.2026", "10:00", "  Работа ")
++        if err != nil {
++                t.Fatalf("add: %v", err)
++        }
++        json, err := s.GetAllTasksSortedJSON()
++        if err != nil {
++                t.Fatalf("all: %v", err)
++        }
++        // Категория нормализуется TrimSpace, дата yyyy-MM-dd -> дд.ММ.гггг
++        want := `[{"id":1,"title":"Отчёт","date":"05.01.2026","time":"10:00","status":0,"category":"Работа"}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
++}
++
++func TestUpdateTask(t *testing.T) {
++        s := newTestService(t)
++        id, _ := s.AddTaskWithCategoryAndGetID("Старое", "01.01.2026", "12:00", "Дом")
++
++        // Полное редактирование: текст, дата (в обратном формате), время, категория.
++        if err := s.UpdateTask(id, "Новое название", "2026-02-15", "09:30", "Работа"); err != nil {
++                t.Fatalf("update: %v", err)
++        }
++        json, _ := s.GetAllTasksSortedJSON()
++        want := `[{"id":1,"title":"Новое название","date":"15.02.2026","time":"09:30","status":0,"category":"Работа"}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
++
++        // Редактирование не трогает статус.
++        if err := s.UpdateTaskStatus(id, 1); err != nil {
++                t.Fatalf("status: %v", err)
++        }
++        if err := s.UpdateTask(id, "Новое 2", "01.03.2026", "08:00", ""); err != nil {
++                t.Fatalf("update2: %v", err)
++        }
++        json, _ = s.GetAllTasksSortedJSON()
++        want = `[{"id":1,"title":"Новое 2","date":"01.03.2026","time":"08:00","status":1,"category":""}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
++}
++
++func TestUpdateTaskCategory(t *testing.T) {
++        s := newTestService(t)
++        id, _ := s.AddTaskAndGetID("Просто задача", "01.01.2026", "12:00")
++
++        if err := s.UpdateTaskCategory(id, "Здоровье"); err != nil {
++                t.Fatalf("cat: %v", err)
++        }
++        json, _ := s.GetAllTasksSortedJSON()
++        want := `[{"id":1,"title":"Просто задача","date":"01.01.2026","time":"12:00","status":0,"category":"Здоровье"}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
+ }
+ 
+ func TestUpdateAndDelete(t *testing.T) {
+-	s := newTestService(t)
+-	id, _ := s.AddTaskAndGetID("X", "01.01.2026", "12:00")
+-
+-	if err := s.UpdateTaskStatus(id, 1); err != nil {
+-		t.Fatalf("update: %v", err)
+-	}
+-	if err := s.DeleteTask(id); err != nil {
+-		t.Fatalf("delete: %v", err)
+-	}
+-	if json, _ := s.GetAllTasksSortedJSON(); json != "[]" {
+-		t.Fatalf("expected empty, got %s", json)
+-	}
++        s := newTestService(t)
++        id, _ := s.AddTaskAndGetID("X", "01.01.2026", "12:00")
++
++        if err := s.UpdateTaskStatus(id, 1); err != nil {
++                t.Fatalf("update: %v", err)
++        }
++        if err := s.DeleteTask(id); err != nil {
++                t.Fatalf("delete: %v", err)
++        }
++        if json, _ := s.GetAllTasksSortedJSON(); json != "[]" {
++                t.Fatalf("expected empty, got %s", json)
++        }
+ }
+ 
+ // Воспроизводит сценарий AlarmActivity: второе подключение к той же БД
+ // параллельно с основным сервисом ( MainActivity ).
+ func TestConcurrentConnections(t *testing.T) {
+-	dir := t.TempDir()
+-	dbPath := filepath.Join(dir, "shared.db")
+-
+-	main, err := NewTodoService(dbPath)
+-	if err != nil {
+-		t.Fatalf("main service: %v", err)
+-	}
+-	defer main.Close()
+-
+-	id, err := main.AddTaskAndGetID("Параллельная запись", "01.01.2026", "12:00")
+-	if err != nil {
+-		t.Fatalf("seed: %v", err)
+-	}
+-
+-	var wg sync.WaitGroup
+-	errs := make(chan error, 20)
+-	for i := 0; i < 10; i++ {
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			second, err := NewTodoService(dbPath) // как в AlarmActivity
+-			if err != nil {
+-				errs <- err
+-				return
+-			}
+-			defer second.Close()
+-			if err := second.UpdateTaskStatus(id, 0); err != nil {
+-				errs <- err
+-			}
+-		}()
+-	}
+-	wg.Wait()
+-	close(errs)
+-	for err := range errs {
+-		t.Errorf("concurrent write: %v", err)
+-	}
++        dir := t.TempDir()
++        dbPath := filepath.Join(dir, "shared.db")
++
++        main, err := NewTodoService(dbPath)
++        if err != nil {
++                t.Fatalf("main service: %v", err)
++        }
++        defer main.Close()
++
++        id, err := main.AddTaskAndGetID("Параллельная запись", "01.01.2026", "12:00")
++        if err != nil {
++                t.Fatalf("seed: %v", err)
++        }
++
++        var wg sync.WaitGroup
++        errs := make(chan error, 20)
++        for i := 0; i < 10; i++ {
++                wg.Add(1)
++                go func() {
++                        defer wg.Done()
++                        second, err := NewTodoService(dbPath) // как в AlarmActivity
++                        if err != nil {
++                                errs <- err
++                                return
++                        }
++                        defer second.Close()
++                        if err := second.UpdateTaskStatus(id, 0); err != nil {
++                                errs <- err
++                        }
++                }()
++        }
++        wg.Wait()
++        close(errs)
++        for err := range errs {
++                t.Errorf("concurrent write: %v", err)
++        }
++}
++
++// Старая база (схема до появления категорий) должна бесшовно мигрировать:
++// колонка category достраивается, данные остаются нетронутыми.
++func TestMigrationFromLegacySchema(t *testing.T) {
++        dir := t.TempDir()
++        dbPath := filepath.Join(dir, "legacy.db")
++
++        legacy, err := sql.Open("sqlite", "file:"+dbPath)
++        if err != nil {
++                t.Fatalf("open legacy: %v", err)
++        }
++        _, err = legacy.Exec(`CREATE TABLE IF NOT EXISTS "tasks" (
++                "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
++                "title" TEXT NOT NULL,
++                "date" TEXT NOT NULL,
++                "time" TEXT NOT NULL,
++                "status" INTEGER NOT NULL
++        );`)
++        if err != nil {
++                t.Fatalf("create legacy: %v", err)
++        }
++        if _, err := legacy.Exec(
++                `INSERT INTO tasks (title, date, time, status) VALUES ('Старая задача', '01.01.2026', '07:00', 0)`,
++        ); err != nil {
++                t.Fatalf("seed legacy: %v", err)
++        }
++        legacy.Close()
++
++        s, err := NewTodoService(dbPath)
++        if err != nil {
++                t.Fatalf("migrated service: %v", err)
++        }
++        defer s.Close()
++
++        json, err := s.GetAllTasksSortedJSON()
++        if err != nil {
++                t.Fatalf("all: %v", err)
++        }
++        want := `[{"id":1,"title":"Старая задача","date":"01.01.2026","time":"07:00","status":0,"category":""}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
++
++        // После миграции редактирование тоже работает.
++        if err := s.UpdateTask(1, "Изменено", "02.01.2026", "07:30", "Покупки"); err != nil {
++                t.Fatalf("update after migration: %v", err)
++        }
++}
++
++// Задачи, запланированные на годы вперёд, обязаны переживать все операции
++// и корректно сортироваться: ядро хранит напоминания бессрочно.
++func TestFarFuturePersistence(t *testing.T) {
++        s := newTestService(t)
++
++        farFuture := "07.11.2036" // через 10 лет
++        id, err := s.AddTaskWithCategoryAndGetID("Проверка через 10 лет", farFuture, "06:30", "Семья")
++        if err != nil {
++                t.Fatalf("add far future: %v", err)
++        }
++
++        // Перезапись статуса туда-обратно (как при свайпе будильника) не должна терять данные.
++        if err := s.UpdateTaskStatus(id, 1); err != nil {
++                t.Fatalf("status on: %v", err)
++        }
++        if err := s.UpdateTaskStatus(id, 0); err != nil {
++                t.Fatalf("status off: %v", err)
++        }
++        if err := s.UpdateTask(id, "Проверка через 10 лет (правка)", farFuture, "06:45", "Семья"); err != nil {
++                t.Fatalf("update: %v", err)
++        }
++
++        json, _ := s.GetAllTasksSortedJSON()
++        want := `[{"id":1,"title":"Проверка через 10 лет (правка)","date":"07.11.2036","time":"06:45","status":0,"category":"Семья"}]`
++        if json != want {
++                t.Fatalf("mismatch:\n got: %s\nwant: %s", json, want)
++        }
+ }
+diff --git a/gradlew b/gradlew
+old mode 100644
+new mode 100755
+index c026f59..ef07e01
+--- a/gradlew
++++ b/gradlew
+@@ -1,251 +1,251 @@
+-#!/bin/sh
+-
+-#
+-# Copyright © 2015 the original authors.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#      https://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-# SPDX-License-Identifier: Apache-2.0
+-#
+-
+-##############################################################################
+-#
+-#   Gradle start up script for POSIX generated by Gradle.
+-#
+-#   Important for running:
+-#
+-#   (1) You need a POSIX-compliant shell to run this script. If your /bin/sh is
+-#       noncompliant, but you have some other compliant shell such as ksh or
+-#       bash, then to run this script, type that shell name before the whole
+-#       command line, like:
+-#
+-#           ksh Gradle
+-#
+-#       Busybox and similar reduced shells will NOT work, because this script
+-#       requires all of these POSIX shell features:
+-#         * functions;
+-#         * expansions «$var», «${var}», «${var:-default}», «${var+SET}»,
+-#           «${var#prefix}», «${var%suffix}», and «$( cmd )»;
+-#         * compound commands having a testable exit status, especially «case»;
+-#         * various built-in commands including «command», «set», and «ulimit».
+-#
+-#   Important for patching:
+-#
+-#   (2) This script targets any POSIX shell, so it avoids extensions provided
+-#       by Bash, Ksh, etc; in particular arrays are avoided.
+-#
+-#       The "traditional" practice of packing multiple parameters into a
+-#       space-separated string is a well documented source of bugs and security
+-#       problems, so this is (mostly) avoided, by progressively accumulating
+-#       options in "$@", and eventually passing that to Java.
+-#
+-#       Where the inherited environment variables (DEFAULT_JVM_OPTS, JAVA_OPTS,
+-#       and GRADLE_OPTS) rely on word-splitting, this is performed explicitly;
+-#       see the in-line comments for details.
+-#
+-#       There are tweaks for specific operating systems such as AIX, CygWin,
+-#       Darwin, MinGW, and NonStop.
+-#
+-#   (3) This script is generated from the Groovy template
+-#       https://github.com/gradle/gradle/blob/HEAD/platforms/jvm/plugins-application/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
+-#       within the Gradle project.
+-#
+-#       You can find Gradle at https://github.com/gradle/gradle/.
+-#
+-##############################################################################
+-
+-# Attempt to set APP_HOME
+-
+-# Resolve links: $0 may be a link
+-app_path=$0
+-
+-# Need this for daisy-chained symlinks.
+-while
+-    APP_HOME=${app_path%"${app_path##*/}"}  # leaves a trailing /; empty if no leading path
+-    [ -h "$app_path" ]
+-do
+-    ls=$( ls -ld "$app_path" )
+-    link=${ls#*' -> '}
+-    case $link in             #(
+-      /*)   app_path=$link ;; #(
+-      *)    app_path=$APP_HOME$link ;;
+-    esac
+-done
+-
+-# This is normally unused
+-# shellcheck disable=SC2034
+-APP_BASE_NAME=${0##*/}
+-# Discard cd standard output in case $CDPATH is set (https://github.com/gradle/gradle/issues/25036)
+-APP_HOME=$( cd -P "${APP_HOME:-./}" > /dev/null && printf '%s\n' "$PWD" ) || exit
+-
+-# Use the maximum available, or set MAX_FD != -1 to use that value.
+-MAX_FD=maximum
+-
+-warn () {
+-    echo "$*"
+-} >&2
+-
+-die () {
+-    echo
+-    echo "$*"
+-    echo
+-    exit 1
+-} >&2
+-
+-# OS specific support (must be 'true' or 'false').
+-cygwin=false
+-msys=false
+-darwin=false
+-nonstop=false
+-case "$( uname )" in                #(
+-  CYGWIN* )         cygwin=true  ;; #(
+-  Darwin* )         darwin=true  ;; #(
+-  MSYS* | MINGW* )  msys=true    ;; #(
+-  NONSTOP* )        nonstop=true ;;
+-esac
+-
+-CLASSPATH="\\\"\\\""
+-
+-
+-# Determine the Java command to use to start the JVM.
+-if [ -n "$JAVA_HOME" ] ; then
+-    if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
+-        # IBM's JDK on AIX uses strange locations for the executables
+-        JAVACMD=$JAVA_HOME/jre/sh/java
+-    else
+-        JAVACMD=$JAVA_HOME/bin/java
+-    fi
+-    if [ ! -x "$JAVACMD" ] ; then
+-        die "ERROR: JAVA_HOME is set to an invalid directory: $JAVA_HOME
+-
+-Please set the JAVA_HOME variable in your environment to match the
+-location of your Java installation."
+-    fi
+-else
+-    JAVACMD=java
+-    if ! command -v java >/dev/null 2>&1
+-    then
+-        die "ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
+-
+-Please set the JAVA_HOME variable in your environment to match the
+-location of your Java installation."
+-    fi
+-fi
+-
+-# Increase the maximum file descriptors if we can.
+-if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
+-    case $MAX_FD in #(
+-      max*)
+-        # In POSIX sh, ulimit -H is undefined. That's why the result is checked to see if it worked.
+-        # shellcheck disable=SC2039,SC3045
+-        MAX_FD=$( ulimit -H -n ) ||
+-            warn "Could not query maximum file descriptor limit"
+-    esac
+-    case $MAX_FD in  #(
+-      '' | soft) :;; #(
+-      *)
+-        # In POSIX sh, ulimit -n is undefined. That's why the result is checked to see if it worked.
+-        # shellcheck disable=SC2039,SC3045
+-        ulimit -n "$MAX_FD" ||
+-            warn "Could not set maximum file descriptor limit to $MAX_FD"
+-    esac
+-fi
+-
+-# Collect all arguments for the java command, stacking in reverse order:
+-#   * args from the command line
+-#   * the main class name
+-#   * -classpath
+-#   * -D...appname settings
+-#   * --module-path (only if needed)
+-#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and GRADLE_OPTS environment variables.
+-
+-# For Cygwin or MSYS, switch paths to Windows format before running java
+-if "$cygwin" || "$msys" ; then
+-    APP_HOME=$( cygpath --path --mixed "$APP_HOME" )
+-    CLASSPATH=$( cygpath --path --mixed "$CLASSPATH" )
+-
+-    JAVACMD=$( cygpath --unix "$JAVACMD" )
+-
+-    # Now convert the arguments - kludge to limit ourselves to /bin/sh
+-    for arg do
+-        if
+-            case $arg in                                #(
+-              -*)   false ;;                            # don't mess with options #(
+-              /?*)  t=${arg#/} t=/${t%%/*}              # looks like a POSIX filepath
+-                    [ -e "$t" ] ;;                      #(
+-              *)    false ;;
+-            esac
+-        then
+-            arg=$( cygpath --path --ignore --mixed "$arg" )
+-        fi
+-        # Roll the args list around exactly as many times as the number of
+-        # args, so each arg winds up back in the position where it started, but
+-        # possibly modified.
+-        #
+-        # NB: a `for` loop captures its iteration list before it begins, so
+-        # changing the positional parameters here affects neither the number of
+-        # iterations, nor the values presented in `arg`.
+-        shift                   # remove old arg
+-        set -- "$@" "$arg"      # push replacement arg
+-    done
+-fi
+-
+-
+-# Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
+-DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+-
+-# Collect all arguments for the java command:
+-#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and optsEnvironmentVar are not allowed to contain shell fragments,
+-#     and any embedded shellness will be escaped.
+-#   * For example: A user cannot expect ${Hostname} to be expanded, as it is an environment variable and will be
+-#     treated as '${Hostname}' itself on the command line.
+-
+-set -- \
+-        "-Dorg.gradle.appname=$APP_BASE_NAME" \
+-        -classpath "$CLASSPATH" \
+-        -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" \
+-        "$@"
+-
+-# Stop when "xargs" is not available.
+-if ! command -v xargs >/dev/null 2>&1
+-then
+-    die "xargs is not available"
+-fi
+-
+-# Use "xargs" to parse quoted args.
+-#
+-# With -n1 it outputs one arg per line, with the quotes and backslashes removed.
+-#
+-# In Bash we could simply go:
+-#
+-#   readarray ARGS < <( xargs -n1 <<<"$var" ) &&
+-#   set -- "${ARGS[@]}" "$@"
+-#
+-# but POSIX shell has neither arrays nor command substitution, so instead we
+-# post-process each arg (as a line of input to sed) to backslash-escape any
+-# character that might be a shell metacharacter, then use eval to reverse
+-# that process (while maintaining the separation between arguments), and wrap
+-# the whole thing up as a single "set" statement.
+-#
+-# This will of course break if any of these variables contains a newline or
+-# an unmatched quote.
+-#
+-
+-eval "set -- $(
+-        printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+-        xargs -n1 |
+-        sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+-        tr '\n' ' '
+-    )" '"$@"'
+-
+-exec "$JAVACMD" "$@"
++#!/bin/sh
++
++#
++# Copyright © 2015 the original authors.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++
++##############################################################################
++#
++#   Gradle start up script for POSIX generated by Gradle.
++#
++#   Important for running:
++#
++#   (1) You need a POSIX-compliant shell to run this script. If your /bin/sh is
++#       noncompliant, but you have some other compliant shell such as ksh or
++#       bash, then to run this script, type that shell name before the whole
++#       command line, like:
++#
++#           ksh Gradle
++#
++#       Busybox and similar reduced shells will NOT work, because this script
++#       requires all of these POSIX shell features:
++#         * functions;
++#         * expansions «$var», «${var}», «${var:-default}», «${var+SET}»,
++#           «${var#prefix}», «${var%suffix}», and «$( cmd )»;
++#         * compound commands having a testable exit status, especially «case»;
++#         * various built-in commands including «command», «set», and «ulimit».
++#
++#   Important for patching:
++#
++#   (2) This script targets any POSIX shell, so it avoids extensions provided
++#       by Bash, Ksh, etc; in particular arrays are avoided.
++#
++#       The "traditional" practice of packing multiple parameters into a
++#       space-separated string is a well documented source of bugs and security
++#       problems, so this is (mostly) avoided, by progressively accumulating
++#       options in "$@", and eventually passing that to Java.
++#
++#       Where the inherited environment variables (DEFAULT_JVM_OPTS, JAVA_OPTS,
++#       and GRADLE_OPTS) rely on word-splitting, this is performed explicitly;
++#       see the in-line comments for details.
++#
++#       There are tweaks for specific operating systems such as AIX, CygWin,
++#       Darwin, MinGW, and NonStop.
++#
++#   (3) This script is generated from the Groovy template
++#       https://github.com/gradle/gradle/blob/HEAD/platforms/jvm/plugins-application/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
++#       within the Gradle project.
++#
++#       You can find Gradle at https://github.com/gradle/gradle/.
++#
++##############################################################################
++
++# Attempt to set APP_HOME
++
++# Resolve links: $0 may be a link
++app_path=$0
++
++# Need this for daisy-chained symlinks.
++while
++    APP_HOME=${app_path%"${app_path##*/}"}  # leaves a trailing /; empty if no leading path
++    [ -h "$app_path" ]
++do
++    ls=$( ls -ld "$app_path" )
++    link=${ls#*' -> '}
++    case $link in             #(
++      /*)   app_path=$link ;; #(
++      *)    app_path=$APP_HOME$link ;;
++    esac
++done
++
++# This is normally unused
++# shellcheck disable=SC2034
++APP_BASE_NAME=${0##*/}
++# Discard cd standard output in case $CDPATH is set (https://github.com/gradle/gradle/issues/25036)
++APP_HOME=$( cd -P "${APP_HOME:-./}" > /dev/null && printf '%s\n' "$PWD" ) || exit
++
++# Use the maximum available, or set MAX_FD != -1 to use that value.
++MAX_FD=maximum
++
++warn () {
++    echo "$*"
++} >&2
++
++die () {
++    echo
++    echo "$*"
++    echo
++    exit 1
++} >&2
++
++# OS specific support (must be 'true' or 'false').
++cygwin=false
++msys=false
++darwin=false
++nonstop=false
++case "$( uname )" in                #(
++  CYGWIN* )         cygwin=true  ;; #(
++  Darwin* )         darwin=true  ;; #(
++  MSYS* | MINGW* )  msys=true    ;; #(
++  NONSTOP* )        nonstop=true ;;
++esac
++
++CLASSPATH="\\\"\\\""
++
++
++# Determine the Java command to use to start the JVM.
++if [ -n "$JAVA_HOME" ] ; then
++    if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
++        # IBM's JDK on AIX uses strange locations for the executables
++        JAVACMD=$JAVA_HOME/jre/sh/java
++    else
++        JAVACMD=$JAVA_HOME/bin/java
++    fi
++    if [ ! -x "$JAVACMD" ] ; then
++        die "ERROR: JAVA_HOME is set to an invalid directory: $JAVA_HOME
++
++Please set the JAVA_HOME variable in your environment to match the
++location of your Java installation."
++    fi
++else
++    JAVACMD=java
++    if ! command -v java >/dev/null 2>&1
++    then
++        die "ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH.
++
++Please set the JAVA_HOME variable in your environment to match the
++location of your Java installation."
++    fi
++fi
++
++# Increase the maximum file descriptors if we can.
++if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
++    case $MAX_FD in #(
++      max*)
++        # In POSIX sh, ulimit -H is undefined. That's why the result is checked to see if it worked.
++        # shellcheck disable=SC2039,SC3045
++        MAX_FD=$( ulimit -H -n ) ||
++            warn "Could not query maximum file descriptor limit"
++    esac
++    case $MAX_FD in  #(
++      '' | soft) :;; #(
++      *)
++        # In POSIX sh, ulimit -n is undefined. That's why the result is checked to see if it worked.
++        # shellcheck disable=SC2039,SC3045
++        ulimit -n "$MAX_FD" ||
++            warn "Could not set maximum file descriptor limit to $MAX_FD"
++    esac
++fi
++
++# Collect all arguments for the java command, stacking in reverse order:
++#   * args from the command line
++#   * the main class name
++#   * -classpath
++#   * -D...appname settings
++#   * --module-path (only if needed)
++#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and GRADLE_OPTS environment variables.
++
++# For Cygwin or MSYS, switch paths to Windows format before running java
++if "$cygwin" || "$msys" ; then
++    APP_HOME=$( cygpath --path --mixed "$APP_HOME" )
++    CLASSPATH=$( cygpath --path --mixed "$CLASSPATH" )
++
++    JAVACMD=$( cygpath --unix "$JAVACMD" )
++
++    # Now convert the arguments - kludge to limit ourselves to /bin/sh
++    for arg do
++        if
++            case $arg in                                #(
++              -*)   false ;;                            # don't mess with options #(
++              /?*)  t=${arg#/} t=/${t%%/*}              # looks like a POSIX filepath
++                    [ -e "$t" ] ;;                      #(
++              *)    false ;;
++            esac
++        then
++            arg=$( cygpath --path --ignore --mixed "$arg" )
++        fi
++        # Roll the args list around exactly as many times as the number of
++        # args, so each arg winds up back in the position where it started, but
++        # possibly modified.
++        #
++        # NB: a `for` loop captures its iteration list before it begins, so
++        # changing the positional parameters here affects neither the number of
++        # iterations, nor the values presented in `arg`.
++        shift                   # remove old arg
++        set -- "$@" "$arg"      # push replacement arg
++    done
++fi
++
++
++# Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
++DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
++
++# Collect all arguments for the java command:
++#   * DEFAULT_JVM_OPTS, JAVA_OPTS, and optsEnvironmentVar are not allowed to contain shell fragments,
++#     and any embedded shellness will be escaped.
++#   * For example: A user cannot expect ${Hostname} to be expanded, as it is an environment variable and will be
++#     treated as '${Hostname}' itself on the command line.
++
++set -- \
++        "-Dorg.gradle.appname=$APP_BASE_NAME" \
++        -classpath "$CLASSPATH" \
++        -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" \
++        "$@"
++
++# Stop when "xargs" is not available.
++if ! command -v xargs >/dev/null 2>&1
++then
++    die "xargs is not available"
++fi
++
++# Use "xargs" to parse quoted args.
++#
++# With -n1 it outputs one arg per line, with the quotes and backslashes removed.
++#
++# In Bash we could simply go:
++#
++#   readarray ARGS < <( xargs -n1 <<<"$var" ) &&
++#   set -- "${ARGS[@]}" "$@"
++#
++# but POSIX shell has neither arrays nor command substitution, so instead we
++# post-process each arg (as a line of input to sed) to backslash-escape any
++# character that might be a shell metacharacter, then use eval to reverse
++# that process (while maintaining the separation between arguments), and wrap
++# the whole thing up as a single "set" statement.
++#
++# This will of course break if any of these variables contains a newline or
++# an unmatched quote.
++#
++
++eval "set -- $(
++        printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
++        xargs -n1 |
++        sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
++        tr '\n' ' '
++    )" '"$@"'
++
++exec "$JAVACMD" "$@"

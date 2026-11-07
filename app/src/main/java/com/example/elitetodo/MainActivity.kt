@@ -1,9 +1,7 @@
 package com.example.elitetodo
 
 import android.Manifest
-import android.app.DatePickerDialog
 import android.app.NotificationManager
-import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -17,7 +15,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -69,9 +66,23 @@ class MainActivity : ComponentActivity() {
 
                 var showAddDialog by remember { mutableStateOf(false) }
                 var taskToDeleteId by remember { mutableStateOf<Int?>(null) }
+                var taskToEditId by remember { mutableStateOf<Int?>(null) }
+                var selectedCategory by remember { mutableStateOf<String?>(null) }
+
+                // Категории и фильтрация: список категорий берётся из ядра,
+                // выбранная категория оставляет на экране только её задачи.
+                val allCategories = tasksState.map { it.category }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .sorted()
+                val visibleTasks = if (selectedCategory == null) tasksState.toList()
+                else tasksState.filter { it.category == selectedCategory }
 
                 TodoScreen(
-                    tasks = tasksState,
+                    tasks = visibleTasks,
+                    categories = allCategories,
+                    selectedCategory = selectedCategory,
+                    onCategorySelected = { selectedCategory = it },
                     onAddTaskClick = { showAddDialog = true },
                     onTaskCheckedChange = { taskEntity, isChecked ->
                         val status = if (isChecked) 1 else 0
@@ -100,6 +111,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     },
+                    onTaskEditClick = { taskEntity -> taskToEditId = taskEntity.id },
                     onTaskMenuClick = { taskEntity -> taskToDeleteId = taskEntity.id }
                 )
 
@@ -144,110 +156,59 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-
+                // Диалог добавления задачи: те же поля, что и при редактировании.
                 if (showAddDialog) {
-                    var taskText by remember { mutableStateOf("") }
                     val currentCal = Calendar.getInstance()
-
-                    var tempDate by remember {
-                        mutableStateOf(
-                            SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(
-                                currentCal.time
-                            )
-                        )
-                    }
-                    var tempTime by remember {
-                        mutableStateOf(
-                            SimpleDateFormat("HH:mm", Locale.getDefault()).format(
-                                currentCal.time
-                            )
-                        )
-                    }
-
-                    AlertDialog(
-                        onDismissRequest = { showAddDialog = false },
-                        containerColor = MaterialTheme.colorScheme.surface,
-                        title = { Text("Новая цель") },
-                        text = {
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                OutlinedTextField(
-                                    value = taskText,
-                                    onValueChange = { taskText = it },
-                                    label = { Text("Что планируем?") },
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Text(
-                                    text = "Запланировано на: $tempDate в $tempTime",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
+                    TaskEditorDialog(
+                        title = "Новая цель",
+                        initialText = "",
+                        initialDate = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(currentCal.time),
+                        initialTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(currentCal.time),
+                        initialCategory = selectedCategory ?: "",
+                        knownCategories = allCategories,
+                        confirmLabel = "СОХРАНИТЬ",
+                        onSave = { text, date, time, category ->
+                            addTask(text, date, time, category)
+                            showAddDialog = false
                         },
-                        confirmButton = {
-                            Button(onClick = {
-                                if (taskText.trim().isNotEmpty()) {
-                                    addTask(taskText.trim(), tempDate, tempTime)
-                                    showAddDialog = false
-                                }
-                            }) {
-                                Text("СОХРАНИТЬ")
-                            }
-                        },
-                        dismissButton = {
-                            Row {
-                                TextButton(onClick = {
-                                    DatePickerDialog(
-                                        this@MainActivity,
-                                        { _, year, month, dayOfMonth ->
-                                            val cal = Calendar.getInstance().apply {
-                                                set(Calendar.YEAR, year)
-                                                set(Calendar.MONTH, month)
-                                                set(Calendar.DAY_OF_MONTH, dayOfMonth)
-                                            }
-                                            tempDate = SimpleDateFormat(
-                                                "dd.MM.yyyy",
-                                                Locale.getDefault()
-                                            ).format(cal.time)
-                                        },
-                                        currentCal.get(Calendar.YEAR),
-                                        currentCal.get(Calendar.MONTH),
-                                        currentCal.get(Calendar.DAY_OF_MONTH)
-                                    ).show()
-                                }) {
-                                    Text("ДАТА")
-                                }
-
-                                TextButton(onClick = {
-                                    TimePickerDialog(
-                                        this@MainActivity,
-                                        { _, hourOfDay, minute ->
-                                            val cal = Calendar.getInstance().apply {
-                                                set(Calendar.HOUR_OF_DAY, hourOfDay)
-                                                set(Calendar.MINUTE, minute)
-                                            }
-                                            tempTime = SimpleDateFormat(
-                                                "HH:mm",
-                                                Locale.getDefault()
-                                            ).format(cal.time)
-                                        },
-                                        currentCal.get(Calendar.HOUR_OF_DAY),
-                                        currentCal.get(Calendar.MINUTE),
-                                        true
-                                    ).show()
-                                }) {
-                                    Text("ВРЕМЯ")
-                                }
-                            }
-                        }
+                        onDismiss = { showAddDialog = false }
                     )
+                }
+
+                // Диалог редактирования: подставляется текущее содержимое задачи,
+                // по кнопке «ПРИМЕНИТЬ» задача переписывается в ядре, а будильник
+                // перевзводится на новое время.
+                taskToEditId?.let { editId ->
+                    tasksState.firstOrNull { it.id == editId }?.let { task ->
+                        TaskEditorDialog(
+                            title = "Редактирование",
+                            initialText = task.title,
+                            initialDate = task.date,
+                            initialTime = task.time,
+                            initialCategory = task.category,
+                            knownCategories = (allCategories + task.category)
+                                .filter { it.isNotBlank() }
+                                .distinct()
+                                .sorted(),
+                            confirmLabel = "ПРИМЕНИТЬ",
+                            onSave = { text, date, time, category ->
+                                editTask(task, text, date, time, category)
+                                taskToEditId = null
+                            },
+                            onDismiss = { taskToEditId = null }
+                        )
+                    }
                 }
             }
         }
     }
-    private fun addTask(text: String, date: String, time: String) {
+
+    private fun addTask(text: String, date: String, time: String, category: String) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // Вся логика форматирования дат и инсерта ушла в Go-слой
-                val insertedId = goTodoService?.addTaskAndGetID(text, date, time) ?: -1L
+                val insertedId = goTodoService
+                    ?.addTaskWithCategoryAndGetID(text, date, time, category) ?: -1L
 
                 if (insertedId != -1L) {
                     // Системный будильник по-прежнему взводим на уровне Kotlin
@@ -259,6 +220,29 @@ class MainActivity : ComponentActivity() {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Ошибка добавления задачи через Go: ${e.message}")
+            }
+        }
+    }
+
+    private fun editTask(original: TaskEntity, text: String, date: String, time: String, category: String) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // Редактирование целиком уходит в Go-ядро: title, date, time и category
+                // переписываются одной операцией, ID и статус задачи сохраняются.
+                goTodoService?.updateTask(original.id.toLong(), text, date, time, category)
+
+                // Будильник обязан следовать за новым временем: снимаем старый
+                // и взводим новый. Выполненную задачу не будим.
+                AndroidAlarmManager.cancelAllForTask(this@MainActivity, original.id)
+                if (original.status == 0) {
+                    AndroidAlarmManager.scheduleNotification(this@MainActivity, original.id, text, date, time)
+                }
+
+                withContext(Dispatchers.Main) {
+                    refreshUi()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Ошибка редактирования задачи через Go: ${e.message}")
             }
         }
     }
@@ -308,10 +292,17 @@ class MainActivity : ComponentActivity() {
                 val taskId = taskIdStr.toIntOrNull() ?: -1
                 Log.d("EliteTodoLOG", "Свайп / Выключение! ID: $taskId")
 
+                // Глушим циклический сигнал и закрываем экран будильника,
+                // если он был открыт (например, выключали кнопкой из шторки).
+                AlarmSoundPlayer.stop()
+                sendBroadcast(
+                    Intent(AlarmActivity.ACTION_STOP_ALARM_UI).setPackage(packageName)
+                )
+
                 if (taskId != -1 && taskId != 0) {
                     lifecycleScope.launch(Dispatchers.IO) {
                         try {
-                            // ИСПРАВЛЕНО: ПриводимtaskId и статус к типу Long с помощью .toLong()
+                            // Приводим taskId и статус к типу Long с помощью .toLong()
                             goTodoService?.updateTaskStatus(taskId.toLong(), 1L)
                             Log.d("EliteTodoLOG", "БД Go: Записан статус 'Выполнено' для ID = $taskId")
 

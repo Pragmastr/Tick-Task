@@ -2,13 +2,17 @@ package com.example.elitetodo
 
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -18,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -26,10 +31,28 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 
 
+private val categoryPalette = listOf(
+    Color(0xFF5C6BC0), // индиго
+    Color(0xFF26A69A), // бирюза
+    Color(0xFFEF6C00), // оранжевый
+    Color(0xFF8E24AA), // фиолетовый
+    Color(0xFF43A047), // зелёный
+    Color(0xFFD81B60), // розовый
+    Color(0xFF1E88E5), // синий
+    Color(0xFF6D4C41)  // коричневый
+)
+
+/** Стабильный цвет категории: одинаков при каждом запуске приложения. */
+fun categoryColor(name: String): Color {
+    val hash = name.hashCode().let { if (it < 0) it.inv() else it }
+    return categoryPalette[hash % categoryPalette.size]
+}
+
 @Composable
 fun TaskItem(
     task: TaskEntity,
     onCheckboxClick: (Boolean) -> Unit,
+    onEditClick: () -> Unit,
     onMenuClick: () -> Unit
 ) {
     val isTaskDone = task.status == 1
@@ -64,6 +87,24 @@ fun TaskItem(
                 textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None,
                 color = if (isTaskDone) Color.Gray else Color.Black
             )
+
+            // Бейдж категории: цветная метка, привязанная к категории из ядра
+            if (task.category.isNotBlank()) {
+                Surface(
+                    color = categoryColor(task.category).copy(alpha = 0.12f),
+                    contentColor = categoryColor(task.category),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.padding(top = 2.dp)
+                ) {
+                    Text(
+                        text = task.category,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                }
+            }
+
             val secondaryText = "${task.date} в ${task.time}"
             if (secondaryText.trim().isNotEmpty())  {
                 Text(
@@ -91,10 +132,9 @@ fun TaskItem(
 
             Spacer(modifier = Modifier.width(4.dp))
 
-            // ИСПРАВЛЕНО: Добавлен Box, чтобы меню знало координаты этой кнопки
             Box {
                 IconButton(
-                    onClick = { menuExpanded = true }, // При клике открываем локальное меню
+                    onClick = { menuExpanded = true },
                     modifier = Modifier.size(24.dp)
                 ) {
                     Icon(
@@ -104,17 +144,37 @@ fun TaskItem(
                     )
                 }
 
-                // ИСПРАВЛЕНО: Выпадающее меню теперь привязано к этой кнопке
                 DropdownMenu(
                     expanded = menuExpanded,
                     onDismissRequest = { menuExpanded = false },
                     modifier = Modifier.background(com.example.elitetodo.ui.theme.SoftLightBlue)
                 ) {
                     DropdownMenuItem(
-                        text = { Text("Удалить") },
+                        text = { Text("Редактировать") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Edit",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
                         onClick = {
                             menuExpanded = false
-                            onMenuClick() // Пробрасываем событие удаления в MainActivity
+                            onEditClick()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Удалить") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "Delete",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        onClick = {
+                            menuExpanded = false
+                            onMenuClick()
                         }
                     )
                 }
@@ -127,24 +187,65 @@ fun TaskItem(
 @Composable
 fun TodoScreen(
     tasks: List<TaskEntity>,
+    categories: List<String>,
+    selectedCategory: String?,
+    onCategorySelected: (String?) -> Unit,
     onAddTaskClick: () -> Unit,
     onTaskCheckedChange : (TaskEntity, Boolean) -> Unit,
+    onTaskEditClick: (TaskEntity) -> Unit,
     onTaskMenuClick: (TaskEntity) -> Unit
 ) {
     Scaffold(
         modifier = Modifier.background(Color.White),
         containerColor = Color.White,
         topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        text = "Tick-Task", // Добавили ваше новое название!
-                        fontWeight = FontWeight.Normal,
-                        color = Color.Black
-                    )
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
-            )
+            Column {
+                TopAppBar(
+                    title = {
+                        Text(
+                            text = "Tick-Task",
+                            fontWeight = FontWeight.Normal,
+                            color = Color.Black
+                        )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+                )
+
+                // Лента категорий-фильтров: «Все» + категории, встречающиеся в задачах.
+                if (categories.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = selectedCategory == null,
+                            onClick = { onCategorySelected(null) },
+                            label = { Text("Все") }
+                        )
+                        categories.forEach { cat ->
+                            FilterChip(
+                                selected = selectedCategory == cat,
+                                onClick = {
+                                    // Повторный тап по выбранной категории возвращает «Все»
+                                    onCategorySelected(if (selectedCategory == cat) null else cat)
+                                },
+                                label = {
+                                    Text(
+                                        text = cat,
+                                        color = if (selectedCategory == cat)
+                                            MaterialTheme.colorScheme.primary
+                                        else
+                                            categoryColor(cat)
+                                    )
+                                }
+                            )
+                        }
+                    }
+                }
+            }
         },
         floatingActionButton = {
             FloatingActionButton(
@@ -164,10 +265,27 @@ fun TodoScreen(
                 .padding(innerPadding),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            if (tasks.isEmpty()) {
+                item {
+                    Text(
+                        text = if (selectedCategory == null)
+                            "Здесь пока пусто.\nНажмите «+», чтобы добавить цель."
+                        else
+                            "В категории «$selectedCategory» задач нет.",
+                        color = Color.Gray,
+                        fontSize = 15.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 48.dp)
+                    )
+                }
+            }
             items(tasks, key = { it.id }) { task ->
                 TaskItem(
                     task = task,
                     onCheckboxClick = { isChecked -> onTaskCheckedChange(task, isChecked) },
+                    onEditClick = { onTaskEditClick(task) },
                     onMenuClick = { onTaskMenuClick(task) }
                 )
             }
