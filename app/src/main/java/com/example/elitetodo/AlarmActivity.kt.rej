@@ -1,0 +1,61 @@
+--- app/src/main/java/com/example/elitetodo/AlarmActivity.kt
++++ app/src/main/java/com/example/elitetodo/AlarmActivity.kt
+@@ -9,10 +9,6 @@ import android.view.WindowManager
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.compose.runtime.Composable
+-import kotlinx.coroutines.CoroutineScope
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.launch
+-import todo.Todo
+ 
+ class AlarmActivity : ComponentActivity() {
+ 
+@@ -34,36 +30,25 @@ class AlarmActivity : ComponentActivity() {
+             )
+         }
+ 
+-        val taskIdStrFromIntent = intent.getStringExtra("alarm_task_id") ?: ""
+-        val taskIdInt = taskIdStrFromIntent.toIntOrNull() ?: 0
+-        val taskIdString = taskIdInt.toString()
++        val taskIdInt = intent.getStringExtra("alarm_task_id")?.toIntOrNull() ?: -1
+         val taskTitle = intent.getStringExtra("alarm_task_title") ?: "Задача"
+ 
+         android.util.Log.d("EliteTodoLOG", "AlarmActivity зажглась! ID = $taskIdInt, Заголовок = '$taskTitle'")
+ 
+         setContent {
+             AlarmActivityContent(taskTitle = taskTitle) {
+-                if (taskIdInt != 0) {
+-                    // Используем фоновый поток через CoroutineScope для вызова Go-библиотеки
+-                    CoroutineScope(Dispatchers.IO).launch {
+-                        try {
+-                            val dbPath = applicationContext.getDatabasePath("elite_final.db").absolutePath
+-                            val goTodoService = Todo.newTodoService(dbPath)
+-
+-                            // ИСПРАВЛЕНО: Применяем .toLong() к первому аргументу и суффикс L ко второму
+-                            goTodoService.updateTaskStatus(taskIdInt.toLong(), 1L)
+-                            goTodoService.close()
+-                            android.util.Log.d("EliteTodoLOG", "AlarmActivity: Статус задачи $taskIdInt сохранен через Go!")
+-                        } catch (e: Exception) {
+-                            android.util.Log.e("EliteTodoLOG", "Ошибка записи в Go из AlarmActivity: ${e.message}")
+-                        }
+-                    }
+-                }
+-
++                // Запись статуса "Выполнено", снятие уведомления и обновление UI целиком
++                // делегируем MainActivity (ACTION_DISMISS_ALARM): у него уже открыт
++                // единственный Go-сервис БД. Второе подключение отсюда ловило
++                // SQLITE_BUSY ("database is locked") и дублировало запись статуса.
+                 val dismissIntent = Intent(this@AlarmActivity, MainActivity::class.java).apply {
+                     action = "ACTION_DISMISS_ALARM"
+-                    putExtra("task_id", taskIdString)
+-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                    putExtra("task_id", taskIdInt.toString())
++                    addFlags(
++                        Intent.FLAG_ACTIVITY_NEW_TASK or
++                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
++                                Intent.FLAG_ACTIVITY_CLEAR_TOP
++                    )
+                 }
+                 startActivity(dismissIntent)
+                 finish()

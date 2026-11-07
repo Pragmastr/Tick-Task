@@ -25,10 +25,17 @@ type TodoService struct {
 
 // NewTodoService открывает базу данных и готовит таблицы. Прогрев происходит атомарно.
 func NewTodoService(dbPath string) (*TodoService, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// busy_timeout заставляет ждущие соединения дожидаться снятия блокировки
+	// вместо мгновенного SQLITE_BUSY; WAL разрешает чтение во время записи.
+	dsn := "file:" + dbPath + "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+
+	// Сериализуем доступ внутри процесса: один писатель — нет взаимных блокировок.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	service := &TodoService{db: db}
 	if err := service.createTables(); err != nil {
@@ -73,6 +80,10 @@ func (s *TodoService) GetAllTasksSortedJSON() (string, error) {
 			return "", err
 		}
 		tasks = append(tasks, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", err
 	}
 
 	if len(tasks) == 0 {

@@ -24,52 +24,91 @@ object AndroidAlarmManager {
         try {
             val dateTimeStr = "$dateStr $timeStr"
             val sdf = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+            sdf.isLenient = false
             val date = sdf.parse(dateTimeStr) ?: return
             val epochTime = date.time
 
-            // ИСПРАВЛЕНО 1: Направляем интент в невидимый системный ресивер, а не на экран Активити
-            //val receiverClass = Class.forName("${context.packageName}.AlarmReceiver")
+            // Не взводим будильник в прошлое: в лучшем случае он сработал бы мгновенно
+            // и разбудил пользователя по уже прошедшей задаче.
+            if (epochTime <= System.currentTimeMillis()) {
+                Log.d(TAG, "[Android] Будильник для ID=$taskId не взведён: время $dateTimeStr уже прошло")
+                return
+            }
+
             val alarmIntent = Intent(context, AlarmReceiver::class.java).apply {
                 action = "ACTION_LAUNCH_ALARM"
                 putExtra("alarm_task_id", taskId.toString())
                 putExtra("alarm_task_title", title)
             }
 
-            // ИСПРАВЛЕНО 2: Для ресиверов в Android 13+ используем FLAG_IMMUTABLE (это безопаснее и железно работает)
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            } else {
-                PendingIntent.FLAG_UPDATE_CURRENT
-            }
+            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
 
             // Создаем PendingIntent для БРОДКАСТА (getBroadcast вместо getActivity)
             val alarmPendingIntent = PendingIntent.getBroadcast(context, taskId + 2000, alarmIntent, flags)
             val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
 
-            // ИСПРАВЛЕНО 3: Переводим на ультимативный метод, который зажигает спящий экран и пробивает Doze Mode
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP, // RTC_WAKEUP силой включает процессор из сна
-                    epochTime,
-                    alarmPendingIntent
-                )
+            val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                alarmManager.canScheduleExactAlarms()
             } else {
-                alarmManager.setExact(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
+                true
             }
 
-            Log.d(TAG, "[Android] Ультимативный будильник взведён на $epochTime мс (пробьет сон и смахнутый кэш)")
+            if (canExact) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.RTC_WAKEUP,
+                        epochTime,
+                        alarmPendingIntent
+                    )
+                } else {
+                    alarmManager.setExact(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
+                }
+            } else {
+                // Пользователь отозвал SCHEDULE_EXACT_ALARM — деградируем до неточного
+                // будильника вместо SecurityException и полной потери напоминания.
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, epochTime, alarmPendingIntent)
+                Log.w(TAG, "[Android] Точные будильники запрещены, взведён неточный для ID=$taskId")
+            }
+
+            Log.d(TAG, "[Android] Будильник взведён на $epochTime мс (ID=$taskId)")
         } catch (e: Exception) {
             Log.e(TAG, "[Ошибка Будильника]: ${e.message}", e)
         }
     }
 
+    /**
+     * Полная зачистка задачи: снимает системный будильник и убирает зависшее
+     * уведомление. Вызывается при удалении задачи и при отметке её выполненной.
+     */
+    fun cancelAllForTask(context: Context, taskId: Int) {
+        try {
+            val alarmIntent = Intent(context, AlarmReceiver::class.java).apply {
+                action = "ACTION_LAUNCH_ALARM"
+                putExtra("alarm_task_id", taskId.toString())
+            }
+            val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            val alarmPendingIntent = PendingIntent.getBroadcast(context, taskId + 2000, alarmIntent, flags)
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            alarmManager.cancel(alarmPendingIntent)
+            alarmPendingIntent.cancel()
+        } catch (e: Exception) {
+            Log.e(TAG, "[Ошибка снятия будильника]: ${e.message}", e)
+        }
+
+        try {
+            val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.cancel(taskId + 1000)
+        } catch (e: Exception) {
+            Log.e(TAG, "[Ошибка отмены уведомления]: ${e.message}", e)
+        }
+    }
 
     fun showAlarmNotification(context: Context, taskId: Int, title: String) {
         try {
             val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val alarmSound = Uri.parse("content://settings/system/alarm_alert")
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {7
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 if (notificationManager.getNotificationChannel(CHANNEL_ID) == null) {
                     val importance = NotificationManager.IMPORTANCE_MAX
                     val channel = NotificationChannel(CHANNEL_ID, "Будильник Списка Дел", importance).apply {
@@ -84,58 +123,37 @@ object AndroidAlarmManager {
                     }
                     notificationManager.createNotificationChannel(channel)
                 }
-
-
-
             }
+
             // Направляем интент на наш ресивер с фейковым экшеном, чтобы система разрешила зажечь экран, но ничего не открывала
-            // ИСПРАВЛЕНО: Направляем интент СТРОГО на AlarmActivity вместо MainActivity
             val alarmIntent = Intent(context, AlarmActivity::class.java).apply {
                 putExtra("alarm_task_id", taskId.toString())
                 putExtra("alarm_task_title", title)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
             }
 
-            val immutableFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            } else {
-                PendingIntent.FLAG_UPDATE_CURRENT
-            }
-            val mutableFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-            } else {
-                PendingIntent.FLAG_UPDATE_CURRENT
-            }
-            val intent = Intent(context, Class.forName("${context.packageName}.MainActivity")).apply {
-                action = "ACTION_LAUNCH_ALARM"
-                putExtra("alarm_task_id", taskId.toString())
-                putExtra("alarm_task_title", title)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            }
+            val immutableFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             val fullScreenPendingIntent = PendingIntent.getActivity(context, taskId + 3000, alarmIntent, immutableFlags)
-            val dismissIntent = Intent(context, Class.forName("${context.packageName}.MainActivity")).apply {
+            val dismissIntent = Intent(context, MainActivity::class.java).apply {
                 action = "ACTION_DISMISS_ALARM"
                 putExtra("task_id", taskId.toString())
                 addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             }
 
-
-
-            val dismissPending = PendingIntent.getActivity(context, taskId + 1000, dismissIntent, mutableFlags)
+            val dismissPending = PendingIntent.getActivity(context, taskId + 1000, dismissIntent, immutableFlags)
 
             val appIconBitmap = android.graphics.BitmapFactory.decodeResource(context.resources, R.mipmap.ic_launcher)
             val builder = NotificationCompat.Builder(context, CHANNEL_ID)
                 .setContentTitle("⏰ СРАБОТАЛ БУДИЛЬНИК!")
                 .setContentText(title)
-//                .setSmallIcon(appIconId)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setCategory(Notification.CATEGORY_ALARM) //если что поменять на alarm
+                .setCategory(Notification.CATEGORY_ALARM)
                 .setSound(alarmSound)
                 .setLargeIcon(appIconBitmap)
                 .setAutoCancel(false)
                 .setOngoing(true)
-                .addAction(R.mipmap.ic_launcher, "ВЫКЛЮЧИТЬ", dismissPending)
+                .addAction(R.drawable.ic_notification, "ВЫКЛЮЧИТЬ", dismissPending)
                 .setFullScreenIntent(fullScreenPendingIntent, true)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
 

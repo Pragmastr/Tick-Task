@@ -19,6 +19,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 
+/** Полная высота свайпа вверх (в пикселях), после которого будильник выключается. */
+private const val SWIPE_DISMISS_THRESHOLD = 160f
+
 @Composable
 fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
     // Бесконечная плавная анимация стрелки вверх-вниз
@@ -33,16 +36,25 @@ fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
         label = "offset"
     )
 
+    // Накопитель вертикального смещения: свайп состоит из множества мелких
+    // событий, порог по одному событию (dragAmount.y < -50) почти недостижим.
+    var accumulatedDrag by remember { mutableFloatStateOf(0f) }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF121212))
             .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
+                detectDragGestures(
+                    onDragStart = { accumulatedDrag = 0f },
+                    onDragEnd = {
+                        if (accumulatedDrag < -SWIPE_DISMISS_THRESHOLD) onDismiss()
+                    },
+                    onDragCancel = { accumulatedDrag = 0f }
+                ) { change, dragAmount ->
                     change.consume()
-                    if (dragAmount.y < -50) {
-                        onDismiss()
-                    }
+                    accumulatedDrag += dragAmount.y
+                    if (accumulatedDrag < -SWIPE_DISMISS_THRESHOLD) onDismiss()
                 }
             },
         contentAlignment = Alignment.Center
