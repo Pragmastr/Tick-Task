@@ -58,7 +58,12 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
 
         setContent {
-            EliteToDoTheme {
+            // Режим темы (SettingsStore.THEME_*) и признак открытого экрана
+            // настроек. Выбор темы применяется мгновенно и сохраняется.
+            var themeMode by remember { mutableIntStateOf(SettingsStore.themeMode(this)) }
+            var showSettings by remember { mutableStateOf(false) }
+
+            EliteToDoTheme(themeMode = themeMode) {
                 LaunchedEffect(Unit) {
                     refreshUi()
                 }
@@ -77,42 +82,55 @@ class MainActivity : ComponentActivity() {
                 val visibleTasks = if (selectedCategory == null) tasksState.toList()
                 else tasksState.filter { it.category == selectedCategory }
 
-                TodoScreen(
-                    tasks = visibleTasks,
-                    categories = allCategories,
-                    selectedCategory = selectedCategory,
-                    onCategorySelected = { selectedCategory = it },
-                    onAddTaskClick = { showAddDialog = true },
-                    onTaskCheckedChange = { taskEntity, isChecked ->
-                        val status = if (isChecked) 1 else 0
-                        lifecycleScope.launch(Dispatchers.IO) {
-                            try {
-                                goTodoService?.updateTaskStatus(
-                                    taskEntity.id.toLong(),
-                                    status.toLong()
-                                )
-                                // Выполненная задача больше не должна будить уведомлением,
-                                // а возврат в "активные" — заново взводит будильник.
-                                if (isChecked) {
-                                    AndroidAlarmManager.cancelAllForTask(this@MainActivity, taskEntity.id)
-                                } else {
-                                    AndroidAlarmManager.scheduleNotification(
-                                        this@MainActivity,
-                                        taskEntity.id,
-                                        taskEntity.title,
-                                        taskEntity.date,
-                                        taskEntity.time
+                if (showSettings) {
+                    // Экран настроек: тема приложения и мелодия будильника.
+                    SettingsScreen(
+                        themeMode = themeMode,
+                        onThemeModeChanged = { mode ->
+                            themeMode = mode
+                            SettingsStore.setThemeMode(this, mode)
+                        },
+                        onBack = { showSettings = false }
+                    )
+                } else {
+                    TodoScreen(
+                        tasks = visibleTasks,
+                        categories = allCategories,
+                        selectedCategory = selectedCategory,
+                        onCategorySelected = { selectedCategory = it },
+                        onAddTaskClick = { showAddDialog = true },
+                        onTaskCheckedChange = { taskEntity, isChecked ->
+                            val status = if (isChecked) 1 else 0
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                try {
+                                    goTodoService?.updateTaskStatus(
+                                        taskEntity.id.toLong(),
+                                        status.toLong()
                                     )
+                                    // Выполненная задача больше не должна будить уведомлением,
+                                    // а возврат в "активные" — заново взводит будильник.
+                                    if (isChecked) {
+                                        AndroidAlarmManager.cancelAllForTask(this@MainActivity, taskEntity.id)
+                                    } else {
+                                        AndroidAlarmManager.scheduleNotification(
+                                            this@MainActivity,
+                                            taskEntity.id,
+                                            taskEntity.title,
+                                            taskEntity.date,
+                                            taskEntity.time
+                                        )
+                                    }
+                                    refreshUi()
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Ошибка изменения статуса в Go: ${e.message}")
                                 }
-                                refreshUi()
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Ошибка изменения статуса в Go: ${e.message}")
                             }
-                        }
-                    },
-                    onTaskEditClick = { taskEntity -> taskToEditId = taskEntity.id },
-                    onTaskMenuClick = { taskEntity -> taskToDeleteId = taskEntity.id }
-                )
+                        },
+                        onTaskEditClick = { taskEntity -> taskToEditId = taskEntity.id },
+                        onTaskMenuClick = { taskEntity -> taskToDeleteId = taskEntity.id },
+                        onSettingsClick = { showSettings = true }
+                    )
+                }
 
                 if (taskToDeleteId != null) {
                     AlertDialog(

@@ -3,7 +3,6 @@ package com.example.elitetodo
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.media.RingtoneManager
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -11,13 +10,21 @@ import android.os.VibratorManager
 import android.util.Log
 
 /**
- * Циклический сигнал будильника.
+ * ЕДИНСТВЕННЫЙ источник звука и вибрации будильника в приложении.
  *
- * Мелодия запускается с isLooping = true — она повторяется БЕСКОНЕЧНО,
- * пока пользователь не выключит будильник (свайп вверх по экрану будильника
- * или кнопка «ВЫКЛЮЧИТЬ» в шторке). Вибрация тоже идёт повторяющимся
- * паттерном без остановки. Раньше сигнал уведомления проигрывался один раз
- * и замолкал — теперь будильник звонит до тех пор, пока его не выключат.
+ * Раньше мелодии накладывались: уведомительный канал звонил своим сигналом
+ * (FLAG_INSISTENT повторял его бесконечно), и параллельно этот MediaPlayer
+ * играл свою мелодию — на заблокированном экране слышались обе. Теперь канал
+ * уведомлений полностью тихий (AndroidAlarmManager), и звук ведёт только этот
+ * плеер: наложение физически невозможно.
+ *
+ * Плеер ведёт себя как настоящий будильник:
+ *  - играет громкостью будильника (USAGE_ALARM), а не уведомлений;
+ *  - мелодия зациклена (isLooping) и звонит, пока будильник не выключат
+ *    свайпом по экрану или кнопкой «ВЫКЛЮЧИТЬ» в уведомлении;
+ *  - вибрация идёт повторяющимся паттерном без остановки;
+ *  - мелодия берётся из настроек (SettingsStore) — одна и та же для звонка
+ *    на заблокированном экране и для шторки при разблокированном.
  */
 object AlarmSoundPlayer {
 
@@ -26,24 +33,37 @@ object AlarmSoundPlayer {
     private var mediaPlayer: MediaPlayer? = null
     private var vibrator: Vibrator? = null
 
+    /** Играет ли сигнал прямо сейчас. */
+    val isPlaying: Boolean
+        get() = mediaPlayer != null
+
     fun start(context: Context) {
-        // Защита от двойного запуска: сперва глушим всё, что могло остаться играть.
-        stop()
+        // Защита от наложения и перезапуска: если сигнал уже играет (например,
+        // его завёл AlarmReceiver на разблокированном экране, а затем поднялся
+        // AlarmActivity), повторный start() ничего не делает — мелодия
+        // продолжается бесшовно, а не наслаивается сама на себя.
+        if (isPlaying) {
+            Log.d(TAG, "Сигнал уже играет, повторный запуск пропущен")
+            return
+        }
+
+        val appContext = context.applicationContext
 
         try {
-            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val alarmUri = AlarmMelodies.resolveUri(
+                appContext,
+                SettingsStore.alarmSoundId(appContext)
+            )
 
             if (alarmUri != null) {
                 val player = MediaPlayer()
                 player.setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ALARM) // играем в громкости будильника, а не медиа
+                        .setUsage(AudioAttributes.USAGE_ALARM) // громкость будильника, а не уведомлений
                         .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                         .build()
                 )
-                player.setDataSource(context, alarmUri)
+                player.setDataSource(appContext, alarmUri)
                 // Ключевая строка: циклическое воспроизведение до бесконечности.
                 player.isLooping = true
                 player.prepare()
@@ -57,11 +77,11 @@ object AlarmSoundPlayer {
         try {
             val vib: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val manager =
-                    context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                    appContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
                 manager.defaultVibrator
             } else {
                 @Suppress("DEPRECATION")
-                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                appContext.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             }
             // Паттерн: 0мс пауза, 600мс вибрация, 800мс тишина; repeat = 0 — цикл с начала.
             val pattern = longArrayOf(0, 600, 800)

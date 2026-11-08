@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
@@ -59,11 +60,16 @@ fun TaskItem(
     // Локальное состояние открытия меню для конкретной карточки
     var menuExpanded by remember { mutableStateOf(false) }
 
+    // Цвета из темы: в светлой теме — белые карточки, в тёмной — тёмные.
+    val itemSurface = MaterialTheme.colorScheme.surface
+    val itemText = MaterialTheme.colorScheme.onSurface
+    val itemSecondary = MaterialTheme.colorScheme.onSurfaceVariant
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .background(Color.White),
+            .background(itemSurface),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
@@ -85,7 +91,7 @@ fun TaskItem(
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Normal,
                 textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None,
-                color = if (isTaskDone) Color.Gray else Color.Black
+                color = if (isTaskDone) itemSecondary else itemText
             )
 
             // Бейдж категории: цветная метка, привязанная к категории из ядра
@@ -110,7 +116,7 @@ fun TaskItem(
                 Text(
                     text = secondaryText,
                     fontSize = 14.sp,
-                    color = Color.Gray,
+                    color = itemSecondary,
                     textDecoration = if (isTaskDone) TextDecoration.LineThrough else TextDecoration.None
                 )
             }
@@ -140,14 +146,14 @@ fun TaskItem(
                     Icon(
                         imageVector = Icons.Default.MoreVert,
                         contentDescription = "More Options",
-                        tint = Color.Gray
+                        tint = itemSecondary
                     )
                 }
 
                 DropdownMenu(
                     expanded = menuExpanded,
                     onDismissRequest = { menuExpanded = false },
-                    modifier = Modifier.background(com.example.elitetodo.ui.theme.SoftLightBlue)
+                    modifier = Modifier.background(MaterialTheme.colorScheme.surface)
                 ) {
                     DropdownMenuItem(
                         text = { Text("Редактировать") },
@@ -193,11 +199,11 @@ fun TodoScreen(
     onAddTaskClick: () -> Unit,
     onTaskCheckedChange : (TaskEntity, Boolean) -> Unit,
     onTaskEditClick: (TaskEntity) -> Unit,
-    onTaskMenuClick: (TaskEntity) -> Unit
+    onTaskMenuClick: (TaskEntity) -> Unit,
+    onSettingsClick: () -> Unit
 ) {
     Scaffold(
-        modifier = Modifier.background(Color.White),
-        containerColor = Color.White,
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             Column {
                 TopAppBar(
@@ -205,10 +211,22 @@ fun TodoScreen(
                         Text(
                             text = "Tick-Task",
                             fontWeight = FontWeight.Normal,
-                            color = Color.Black
+                            color = MaterialTheme.colorScheme.onBackground
                         )
                     },
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
+                    actions = {
+                        // Шестерёнка настроек: тема и мелодия будильника.
+                        IconButton(onClick = onSettingsClick) {
+                            Icon(
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = "Настройки",
+                                tint = MaterialTheme.colorScheme.onBackground
+                            )
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background
+                    )
                 )
 
                 // Лента категорий-фильтров: «Все» + категории, встречающиеся в задачах.
@@ -272,7 +290,7 @@ fun TodoScreen(
                             "Здесь пока пусто.\nНажмите «+», чтобы добавить цель."
                         else
                             "В категории «$selectedCategory» задач нет.",
-                        color = Color.Gray,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 15.sp,
                         textAlign = TextAlign.Center,
                         modifier = Modifier

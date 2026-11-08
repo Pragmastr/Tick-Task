@@ -10,43 +10,50 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import com.example.elitetodo.SettingsStore
+
 private val DarkColorScheme = darkColorScheme(
     primary = MainBlue,
     secondary = LightBlue,
     background = Color(0xFF121212),   // Глубокий темный фон
     surface = Color(0xFF1E1E1E),      // Темные карточки задач
-    onPrimary = Color.Black,
+    surfaceVariant = Color(0xFF2A2A2A),
+    onPrimary = Color.White,
     onBackground = Color.White,
-    onSurface = Color.White
+    onSurface = Color.White,
+    onSurfaceVariant = Color(0xFFB8B8B8)
 )
 
 private val LightColorScheme = lightColorScheme(
     primary = MainBlue,
     secondary = LightBlue,
     background = AppBackground,
-    surface = SoftLightBlue,
+    surface = CardSurface,
+    surfaceVariant = Color(0xFFF0F0F0),
     onPrimary = Color.White,       // Текст внутри голубых кнопок будет белым
     onBackground = TextBlack,      // Текст задач будет черным
-    onSurface = TextBlack          // Текст в шапке будет черным
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+    onSurface = TextBlack,         // Текст в шапке будет черным
+    onSurfaceVariant = TextGray    // Второстепенный текст: даты, подписи
 )
 
+/**
+ * Тема приложения с выбором режима из настроек:
+ * THEME_SYSTEM — как в системе, THEME_LIGHT — всегда светлая,
+ * THEME_DARK — всегда тёмная.
+ */
 @Composable
 fun EliteToDoTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    themeMode: Int = SettingsStore.THEME_SYSTEM,
     // Dynamic color is available on Android 12+
     dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
+    val darkTheme = when (themeMode) {
+        SettingsStore.THEME_LIGHT -> false
+        SettingsStore.THEME_DARK -> true
+        else -> isSystemInDarkTheme()
+    }
+
     val colorScheme = when {
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val context = LocalContext.current
