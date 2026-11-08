@@ -16,6 +16,11 @@ class AlarmReceiver : BroadcastReceiver() {
             val title = intent.getStringExtra("alarm_task_title") ?: "Задача"
 
             if (taskId != -1) {
+                // Если зазвонил ОТЛОЖЕННЫЙ будильник — учётная запись отложки
+                // своё отработала, снимаем её (неважно, обычный это звонок
+                // или snooze: у активной отложки запись всё равно одна).
+                SnoozeStore.clear(context, taskId)
+
                 // Тихое уведомление с full-screen intent: на заблокированном
                 // экране система поднимет по нему полноэкранный будильник,
                 // на разблокированном покажет шторкой (heads-up).

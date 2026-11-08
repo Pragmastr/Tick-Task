@@ -1,7 +1,6 @@
 package com.example.elitetodo
 
 import android.content.Context
-import android.media.RingtoneManager
 import android.net.Uri
 
 /**
@@ -11,9 +10,17 @@ import android.net.Uri
  * будильнике при заблокированном экране, и в шторке при разблокированном —
  * потому что единственный источник звука (AlarmSoundPlayer) берёт её отсюда.
  *
- * Помимо системного сигнала в приложение пакуются пять встроенных мелодий
- * (res/raw, зацикленные WAV): их можно слушать в настройках и выбирать
- * без похода в системные настройки Android.
+ * Помимо варианта «По умолчанию» в приложение пакуются пять встроенных
+ * мелодий (res/raw, зацикленные WAV): их можно слушать в настройках и
+ * выбирать без похода в системные настройки Android.
+ *
+ * «По умолчанию» — это НЕ системный сигнал будильника Android, а звук,
+ * выбранный пользователем в настройках САМОГО ПРИЛОЖЕНИЯ:
+ * Настройки Android → Приложения → Tick-Task → Уведомления → канал
+ * «Мелодия “По умолчанию”» → Звук. Там можно выбрать любую системную
+ * мелодию или файл — приложение прочитает её из канала и будет звонить
+ * именно ею. Если пользователь ничего не задавал, звучит системный сигнал
+ * УВЕДОМЛЕНИЙ по умолчанию (не сигнал будильника системы).
  */
 object AlarmMelodies {
 
@@ -27,8 +34,12 @@ object AlarmMelodies {
         val rawResId: Int
     )
 
-    /** Системный сигнал будильника, установленный в Android. */
-    val SYSTEM = Melody(SettingsStore.DEFAULT_ALARM_SOUND, "Системный сигнал", 0)
+    /**
+     * «По умолчанию» — звук из настроек уведомлений Android для этого
+     * приложения (см. описание класса). id сохранён прежний ("system"),
+     * чтобы не ломать выбор пользователей прошлых версий.
+     */
+    val SYSTEM = Melody(SettingsStore.DEFAULT_ALARM_SOUND, "По умолчанию (настройки Android)", 0)
 
     /** Встроенные мелодии приложения. */
     val BUILT_IN = listOf(
@@ -46,8 +57,9 @@ object AlarmMelodies {
 
     /**
      * URI мелодии для MediaPlayer. Для встроенных — android.resource://,
-     * для системной — текущий сигнал будильника Android с каскадом фолбэков
-     * (будильник → рингтон → уведомление), как принято в будильных приложениях.
+     * для «По умолчанию» — звук из канала уведомлений приложения, который
+     * пользователь задал в системных настройках Android; если он не задан —
+     * системный сигнал уведомлений по умолчанию (но НЕ системный будильник).
      */
     fun resolveUri(context: Context, id: String): Uri? {
         val melody = byId(id)
@@ -56,8 +68,8 @@ object AlarmMelodies {
                 "android.resource://${context.packageName}/${melody.rawResId}"
             )
         }
-        return RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        // Канал создаётся/читается в AndroidAlarmManager — он отвечает за
+        // все каналы уведомлений приложения.
+        return AndroidAlarmManager.defaultMelodyUri(context)
     }
 }

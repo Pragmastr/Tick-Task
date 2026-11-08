@@ -47,7 +47,15 @@ class BootReceiver : BroadcastReceiver() {
 
             var armed = 0
             for (task in tasks) {
-                if (task.status == 0) {
+                if (task.status != 0) continue
+
+                // Отложка тоже переживает перезагрузку: если пользователь
+                // отложил будильник и выключил телефон, перевзводим её на
+                // сохранённое время (SnoozeStore), а не теряем до перезвона.
+                val snoozeAt = SnoozeStore.get(context, task.id)
+                if (snoozeAt > System.currentTimeMillis()) {
+                    AndroidAlarmManager.rearmSnooze(context, task.id, task.title, snoozeAt)
+                } else {
                     // scheduleNotification сам пропустит задачи с прошедшей датой.
                     AndroidAlarmManager.scheduleNotification(
                         context,
@@ -56,8 +64,8 @@ class BootReceiver : BroadcastReceiver() {
                         task.date,
                         task.time
                     )
-                    armed++
                 }
+                armed++
             }
             Log.d("BootReceiver", "Перевзведено будильников: $armed из ${tasks.size}")
         } catch (e: Exception) {

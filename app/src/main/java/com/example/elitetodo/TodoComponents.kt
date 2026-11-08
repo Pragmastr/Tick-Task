@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
@@ -59,6 +60,11 @@ fun TaskItem(
     val isTaskDone = task.status == 1
     // Локальное состояние открытия меню для конкретной карточки
     var menuExpanded by remember { mutableStateOf(false) }
+
+    // Правило повтора: читается из RecurrenceStore на каждый рекомпозицию —
+    // чтение SharedPreferences дешёвое, зато бейдж всегда актуален после правки.
+    val context = LocalContext.current
+    val recurrence = RecurrenceStore.get(context, task.id)
 
     // Цвета из темы: в светлой теме — белые карточки, в тёмной — тёмные.
     val itemSurface = MaterialTheme.colorScheme.surface
@@ -104,6 +110,23 @@ fun TaskItem(
                 ) {
                     Text(
                         text = task.category,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                }
+            }
+
+            // Бейдж повтора: «Каждый день», «По дням: Пн, Ср, Пт» и т.п.
+            if (recurrence.isRepeating) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
+                    contentColor = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.padding(top = 2.dp)
+                ) {
+                    Text(
+                        text = recurrence.summary(),
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)

@@ -145,8 +145,10 @@ class MainActivity : ComponentActivity() {
                                         lifecycleScope.launch(Dispatchers.IO) {
                                             try {
                                                 goTodoService?.deleteTask(id.toLong())
-                                                // Задача удалена — снимаем её будильник и уведомление,
-                                                // иначе будильник сработает по несуществующей задаче.
+                                                // Задача удалена — снимаем её будильник, отложку,
+                                                // правило повтора и уведомление, иначе будильник
+                                                // сработает по несуществующей задаче.
+                                                RecurrenceStore.remove(this@MainActivity, id)
                                                 AndroidAlarmManager.cancelAllForTask(this@MainActivity, id)
                                                 refreshUi()
                                             } catch (e: Exception) {
@@ -182,10 +184,11 @@ class MainActivity : ComponentActivity() {
                         initialDate = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(currentCal.time),
                         initialTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(currentCal.time),
                         initialCategory = selectedCategory ?: "",
+                        initialRecurrence = TaskRecurrence(),
                         knownCategories = allCategories,
                         confirmLabel = "СОХРАНИТЬ",
-                        onSave = { text, date, time, category ->
-                            addTask(text, date, time, category)
+                        onSave = { text, date, time, category, recurrence ->
+                            addTask(text, date, time, category, recurrence)
                             showAddDialog = false
                         },
                         onDismiss = { showAddDialog = false }
@@ -194,7 +197,8 @@ class MainActivity : ComponentActivity() {
 
                 // Диалог редактирования: подставляется текущее содержимое задачи,
                 // по кнопке «ПРИМЕНИТЬ» задача переписывается в ядре, а будильник
-                // перевзводится на новое время.
+                // перевзводится на новое время. Правило повтора читается из
+                // RecurrenceStore и сохраняется обратно после правки.
                 taskToEditId?.let { editId ->
                     tasksState.firstOrNull { it.id == editId }?.let { task ->
                         TaskEditorDialog(
@@ -203,13 +207,14 @@ class MainActivity : ComponentActivity() {
                             initialDate = task.date,
                             initialTime = task.time,
                             initialCategory = task.category,
+                            initialRecurrence = RecurrenceStore.get(this@MainActivity, task.id),
                             knownCategories = (allCategories + task.category)
                                 .filter { it.isNotBlank() }
                                 .distinct()
                                 .sorted(),
                             confirmLabel = "ПРИМЕНИТЬ",
-                            onSave = { text, date, time, category ->
-                                editTask(task, text, date, time, category)
+                            onSave = { text, date, time, category, recurrence ->
+                                editTask(task, text, date, time, category, recurrence)
                                 taskToEditId = null
                             },
                             onDismiss = { taskToEditId = null }
@@ -220,7 +225,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun addTask(text: String, date: String, time: String, category: String) {
+    private fun addTask(
+        text: String,
+        date: String,
+        time: String,
+        category: String,
+        recurrence: TaskRecurrence
+    ) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // Вся логика форматирования дат и инсерта ушла в Go-слой
@@ -228,6 +239,9 @@ class MainActivity : ComponentActivity() {
                     ?.addTaskWithCategoryAndGetID(text, date, time, category) ?: -1L
 
                 if (insertedId != -1L) {
+                    // Правило повтора живёт в Kotlin-слое (RecurrenceStore).
+                    RecurrenceStore.set(this@MainActivity, insertedId.toInt(), recurrence)
+
                     // Системный будильник по-прежнему взводим на уровне Kotlin
                     AndroidAlarmManager.scheduleNotification(this@MainActivity, insertedId.toInt(), text, date, time)
                 }
@@ -241,12 +255,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun editTask(original: TaskEntity, text: String, date: String, time: String, category: String) {
+    private fun editTask(
+        original: TaskEntity,
+        text: String,
+        date: String,
+        time: String,
+        category: String,
+        recurrence: TaskRecurrence
+    ) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // Редактирование целиком уходит в Go-ядро: title, date, time и category
                 // переписываются одной операцией, ID и статус задачи сохраняются.
                 goTodoService?.updateTask(original.id.toLong(), text, date, time, category)
+
+                // Правило повтора обновляется вместе с содержимым задачи.
+                RecurrenceStore.set(this@MainActivity, original.id, recurrence)
 
                 // Будильник обязан следовать за новым временем: снимаем старый
                 // и взводим новый. Выполненную задачу не будим.
@@ -285,6 +309,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Поиск задачи в базе Go по id; вызывается только из фонового потока. */
+    private fun findTaskInDb(taskId: Int): TaskEntity? = try {
+        val json = goTodoService?.allTasksSortedJSON ?: return null
+        val type = object : TypeToken<List<TaskEntity>>() {}.type
+        val tasks: List<TaskEntity> = gson.fromJson(json, type) ?: emptyList()
+        tasks.firstOrNull { it.id == taskId }
+    } catch (e: Exception) {
+        Log.e(TAG, "Ошибка поиска задачи ID=$taskId в Go: ${e.message}")
+        null
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -319,9 +354,39 @@ class MainActivity : ComponentActivity() {
                 if (taskId != -1 && taskId != 0) {
                     lifecycleScope.launch(Dispatchers.IO) {
                         try {
-                            // Приводим taskId и статус к типу Long с помощью .toLong()
-                            goTodoService?.updateTaskStatus(taskId.toLong(), 1L)
-                            Log.d("EliteTodoLOG", "БД Go: Записан статус 'Выполнено' для ID = $taskId")
+                            // Повторяющаяся задача не выполняется, а переезжает
+                            // на следующий слот: вычисляем его из правила,
+                            // переписываем дату/время в ядре и перевзводим
+                            // системный будильник. Статус остаётся «активна».
+                            val task = findTaskInDb(taskId)
+                            val recurrence = RecurrenceStore.get(this@MainActivity, taskId)
+                            val next = if (recurrence.isRepeating && task != null) {
+                                recurrence.nextOccurrence(task.date, task.time)
+                            } else {
+                                null
+                            }
+
+                            if (task != null && next != null) {
+                                goTodoService?.updateTask(
+                                    taskId.toLong(),
+                                    task.title,
+                                    next.first,
+                                    next.second,
+                                    task.category
+                                )
+                                AndroidAlarmManager.scheduleNotification(
+                                    this@MainActivity,
+                                    taskId,
+                                    task.title,
+                                    next.first,
+                                    next.second
+                                )
+                                Log.d("EliteTodoLOG", "Повтор: задача ID=$taskId переведена на ${next.first} ${next.second}")
+                            } else {
+                                // Обычная задача — как раньше, помечаем выполненной.
+                                goTodoService?.updateTaskStatus(taskId.toLong(), 1L)
+                                Log.d("EliteTodoLOG", "БД Go: Записан статус 'Выполнено' для ID = $taskId")
+                            }
 
                             refreshUi()
                         } catch (e: Exception) {
@@ -331,6 +396,9 @@ class MainActivity : ComponentActivity() {
 
                     val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                     notificationManager.cancel(taskId + 1000)
+
+                    // Страховка: учётная запись отложки больше не нужна.
+                    SnoozeStore.clear(this, taskId)
                 }
 
                 intent.action = ""

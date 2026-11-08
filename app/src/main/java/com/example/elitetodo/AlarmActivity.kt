@@ -58,6 +58,7 @@ class AlarmActivity : ComponentActivity() {
 
         val taskIdInt = intent.getStringExtra("alarm_task_id")?.toIntOrNull() ?: -1
         val taskTitle = intent.getStringExtra("alarm_task_title") ?: "Задача"
+        val snoozeMinutes = SettingsStore.snoozeMinutes(this)
 
         android.util.Log.d("EliteTodoLOG", "AlarmActivity зажглась! ID = $taskIdInt, Заголовок = '$taskTitle'")
 
@@ -80,24 +81,38 @@ class AlarmActivity : ComponentActivity() {
         )
 
         setContent {
-            AlarmActivityContent(taskTitle = taskTitle) {
-                // Запись статуса "Выполнено", снятие уведомления и обновление UI целиком
-                // делегируем MainActivity (ACTION_DISMISS_ALARM): у него уже открыт
-                // единственный Go-сервис БД. Второе подключение отсюда ловило
-                // SQLITE_BUSY ("database is locked") и дублировало запись статуса.
-                AlarmSoundPlayer.stop()
-                val dismissIntent = Intent(this@AlarmActivity, MainActivity::class.java).apply {
-                    action = "ACTION_DISMISS_ALARM"
-                    putExtra("task_id", taskIdInt.toString())
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    )
+            AlarmActivityContent(
+                taskTitle = taskTitle,
+                snoozeMinutes = snoozeMinutes,
+                // Без корректного id задачи откладывать нечего — кнопки нет.
+                onSnooze = if (taskIdInt != -1) {
+                    {
+                        // Отложить: глушим сигнал, прячем уведомление и
+                        // перевзводим будильник на N минут. Задача остаётся
+                        // активной, экран будильника закрывается.
+                        AndroidAlarmManager.snoozeAlarm(this@AlarmActivity, taskIdInt, taskTitle)
+                        finish()
+                    }
+                } else null,
+                onDismiss = {
+                    // Запись статуса "Выполнено", снятие уведомления и обновление UI целиком
+                    // делегируем MainActivity (ACTION_DISMISS_ALARM): у него уже открыт
+                    // единственный Go-сервис БД. Второе подключение отсюда ловило
+                    // SQLITE_BUSY ("database is locked") и дублировало запись статуса.
+                    AlarmSoundPlayer.stop()
+                    val dismissIntent = Intent(this@AlarmActivity, MainActivity::class.java).apply {
+                        action = "ACTION_DISMISS_ALARM"
+                        putExtra("task_id", taskIdInt.toString())
+                        addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK or
+                                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        )
+                    }
+                    startActivity(dismissIntent)
+                    finish()
                 }
-                startActivity(dismissIntent)
-                finish()
-            }
+            )
         }
     }
 
@@ -113,6 +128,16 @@ class AlarmActivity : ComponentActivity() {
 }
 
 @Composable
-fun AlarmActivityContent(taskTitle: String, onDismiss: () -> Unit) {
-    AlarmScreen(taskTitle = taskTitle, onDismiss = onDismiss)
+fun AlarmActivityContent(
+    taskTitle: String,
+    snoozeMinutes: Int,
+    onSnooze: (() -> Unit)?,
+    onDismiss: () -> Unit
+) {
+    AlarmScreen(
+        taskTitle = taskTitle,
+        snoozeMinutes = snoozeMinutes,
+        onSnooze = onSnooze,
+        onDismiss = onDismiss
+    )
 }

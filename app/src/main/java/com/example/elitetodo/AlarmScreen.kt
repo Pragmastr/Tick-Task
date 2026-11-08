@@ -1,12 +1,16 @@
 package com.example.elitetodo
 
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -23,7 +27,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 private const val SWIPE_DISMISS_THRESHOLD = 160f
 
 @Composable
-fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
+fun AlarmScreen(
+    taskTitle: String,
+    snoozeMinutes: Int,
+    onSnooze: (() -> Unit)?,
+    onDismiss: () -> Unit
+) {
     // Бесконечная плавная анимация стрелки вверх-вниз
     val infiniteTransition = rememberInfiniteTransition(label = "arrow")
     val arrowOffset by infiniteTransition.animateFloat(
@@ -117,7 +126,30 @@ fun AlarmScreen(taskTitle: String, onDismiss: () -> Unit) {
             )
         }
 
-        // 3. НИЖНИЙ БЛОК: Анимированная стрелка и текст свайпа
+        // 3. КНОПКА «ОТЛОЖИТЬ»: переносит сигнал на snoozeMinutes минут.
+        // Задача остаётся активной; свайп вверх по-прежнему выключает будильник.
+        if (onSnooze != null) {
+            OutlinedButton(
+                onClick = onSnooze,
+                shape = RoundedCornerShape(28.dp),
+                border = BorderStroke(1.dp, Color(0xFFFFB74D)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFFB74D)),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .padding(horizontal = 40.dp)
+                    .padding(bottom = 150.dp)
+                    .height(52.dp)
+            ) {
+                Text(
+                    text = "ОТЛОЖИТЬ НА $snoozeMinutes МИН",
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+            }
+        }
+
+        // 4. НИЖНИЙ БЛОК: Анимированная стрелка и текст свайпа
         Column(
             modifier = Modifier
                 .fillMaxWidth()

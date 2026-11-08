@@ -1,7 +1,11 @@
 package com.example.elitetodo
 
+import android.content.Intent
 import android.media.AudioAttributes
 import android.media.MediaPlayer
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -30,6 +34,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -48,11 +53,14 @@ import androidx.compose.ui.unit.sp
  * Экран настроек.
  *
  *  - «Тема приложения»: как в системе / всегда светлая / всегда тёмная.
- *  - «Мелодия будильника»: системный сигнал или одна из пяти встроенных
- *    мелодий. Мелодия едина для всех точек звука приложения: и для
- *    полноэкранного будильника на заблокированном экране, и для
- *    уведомления-шторки при разблокированном — обе точки берут её
- *    через AlarmSoundPlayer.
+ *  - «Мелодия будильника»: «По умолчанию» (звук из настроек Android для
+ *    приложения) или одна из пяти встроенных мелодий. Мелодия едина для всех
+ *    точек звука приложения: и для полноэкранного будильника на
+ *    заблокированном экране, и для уведомления-шторки при разблокированном —
+ *    обе точки берут её через AlarmSoundPlayer.
+ *  - Переход в системные настройки Android, где выбирается звук для варианта
+ *    «По умолчанию» (канал «Мелодия “По умолчанию”»).
+ *  - «Кнопка “Отложить”»: интервал переноса сигнала (5/10/15/30 минут).
  *
  * Тап по мелодии сразу сохраняет выбор и проигрывает короткое прослушивание;
  * повторный тап останавливает. Прослушивание — отдельный плеер, он не трогает
@@ -73,6 +81,30 @@ fun SettingsScreen(
     var selectedSoundId by remember { mutableStateOf(SettingsStore.alarmSoundId(context)) }
     var previewPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var previewingId by remember { mutableStateOf<String?>(null) }
+    var snoozeMinutes by remember { mutableStateOf(SettingsStore.snoozeMinutes(context)) }
+
+    // Открывает настройки Android именно этого приложения: на Android 8+ —
+    // настройки канала «Мелодия “По умолчанию”», там выбирается звук для
+    // варианта «По умолчанию». На Android 7 — страницу приложения.
+    fun openAndroidSoundSettings() {
+        try {
+            AndroidAlarmManager.ensureNotificationChannels(context)
+            val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                    putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                    putExtra(Settings.EXTRA_CHANNEL_ID, AndroidAlarmManager.DEFAULT_SOUND_CHANNEL_ID)
+                }
+            } else {
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:" + context.packageName)
+                }
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            // На отдельных прошивках экран канала может отсутствовать —
+            // просто ничего не делаем.
+        }
+    }
 
     fun stopPreview() {
         previewPlayer?.let { player ->
@@ -236,8 +268,11 @@ fun SettingsScreen(
                             )
                             if (melody.rawResId == 0) {
                                 Text(
-                                    text = "Сигнал будильника, установленный в Android",
+                                    text = "Звук из настроек Android: Приложения → Tick-Task → " +
+                                            "Уведомления → «Мелодия “По умолчанию”» → Звук. " +
+                                            "Если звук не задан — системный сигнал уведомлений.",
                                     fontSize = 12.sp,
+                                    lineHeight = 16.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
@@ -255,6 +290,82 @@ fun SettingsScreen(
                 lineHeight = 18.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Быстрый переход к настройке звука «По умолчанию» в Android:
+            // настройки приложения → уведомления → канал «Мелодия “По умолчанию”».
+            SettingsCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { openAndroidSoundSettings() }
+                        .padding(vertical = 12.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MusicNote,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(end = 10.dp)
+                    )
+                    Column {
+                        Text(
+                            text = "Выбрать звук «По умолчанию» в Android",
+                            fontSize = 16.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Открывает настройки уведомлений приложения " +
+                                    "(канал «Мелодия “По умолчанию”»)",
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            // ────────────────── КНОПКА «ОТЛОЖИТЬ» (SNOOZE) ──────────────────
+            SectionTitle("КНОПКА «ОТЛОЖИТЬ»")
+            Text(
+                text = "На сколько минут переносится сигнал, когда вы нажимаете " +
+                        "«Отложить» на экране будильника или в уведомлении. " +
+                        "Задача при этом остаётся активной и зазвонит снова.",
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 10.dp)
+            )
+            SettingsCard {
+                SettingsStore.SNOOZE_OPTIONS.forEachIndexed { index, minutes ->
+                    if (index > 0) HorizontalDivider()
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                snoozeMinutes = minutes
+                                SettingsStore.setSnoozeMinutes(context, minutes)
+                            }
+                            .padding(vertical = 12.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        RadioButton(
+                            selected = snoozeMinutes == minutes,
+                            onClick = null
+                        )
+                        Text(
+                            text = "$minutes минут",
+                            fontSize = 16.sp,
+                            fontWeight = if (snoozeMinutes == minutes) FontWeight.SemiBold else FontWeight.Normal,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
 
             Spacer(modifier = Modifier.height(32.dp))
         }
